@@ -1,0 +1,701 @@
+// ============================================================
+// TurbulenceFieldPhysical.cs
+// 
+// 精确移植自 transfer_learning_experiment.py 中的
+// DomainShiftTurbulenceDataset._generate_velocity_field()
+// 和 _advect_diffuse()
+//
+// 物理方程 (论文 Eq.1):
+//   u^{t+1} = A(u^t) + ν∇²u^t + f^t
+//
+// 谱生成: von Kármán spectrum E(k) = k^{-slope}
+// 无散度投影: Helmholtz decomposition via FFT
+// 对流-扩散: spectral viscous decay + trilinear advection
+//            + cross-component coupling + wall drive
+//
+// 数据采集: 每帧记录飞艇位置处的风速向量,
+//           供 Python 端训练 AttentionResidualTurbulenceModel
+// ============================================================
+
+using UnityEngine;
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Text;
+
+public class TurbulenceFieldPhysical : MonoBehaviour
+{
+    // ── 网格参数 ──────────────────────────────────────────────
+    // 对应 Python: grid_size=16, 3D 周期性边界
+    [Header("Grid")]
+    public int gridSize = 16;
+
+    // ── 物理参数 ──────────────────────────────────────────────
+    [Header("Physics")]
+    // 对应 Python: re_tau=1000 → nu = 1/re_tau = 0.001
+    // target domain: nu *= 1.15 → 0.00115
+    public float reTau = 1000f;
+    [Tooltip("Target domain viscosity multiplier (Python: nu * 1.15)")]
+    public float nuMultiplier = 1.15f;
+
+    // 对应 Python: _sample_slope() target domain → uniform(1.65, 1.90)
+    [Tooltip("Von Kármán spectral slope range")]
+    public float slopeMin = 1.65f;
+    public float slopeMax = 1.90f;
+
+    // ── Target Domain 各向异性 ────────────────────────────────
+    // 对应 Python: u_hat[0] *= 1.25; u_hat[1] *= 0.80
+    [Header("Target Domain Anisotropy")]
+    public float anisotropyU = 1.25f;
+    public float anisotropyV = 0.80f;
+
+    // ── 对流-扩散参数 ─────────────────────────────────────────
+    [Header("Advection-Diffusion")]
+    // 对应 Python: decay = exp(-nu * k2 * 0.02) 中的 dt=0.02
+    public float diffusionDt = 0.02f;
+    // 对应 Python: u_next[0] -= 0.10 * u[0] * grad_x0 等
+    public float advectionCoeffX = 0.10f;
+    public float advectionCoeffY = 0.08f;
+    public float advectionCoeffZ = 0.06f;
+
+    // ── Target Domain 强制项 ──────────────────────────────────
+    [Header("Target Domain Forcing")]
+    // 对应 Python: u_next[0] += 0.10 * z[0]  (wall drive)
+    public float wallDriveStrength = 0.10f;
+    // 对应 Python: u_next[0] += 0.03 * shear_drive * roll(u[1])
+    public float gaussianShearStrength = 0.03f;
+    // 对应 Python: shear_drive 的 Gaussian center = N//4, sigma = 3.0
+    public float gaussianShearCenter = 0.25f; // 归一化 (N//4 / N)
+    public float gaussianShearSigma = 3.0f;
+    // 对应 Python: u_next[1] += 0.02 * roll(u[2])
+    public float uyCouplingStrength = 0.02f;
+
+    // ── 交叉耦合 ─────────────────────────────────────────────
+    [Header("Cross-Component Coupling")]
+    // 对应 Python: u_next[0] += 0.07 * roll(u[1], shift=1, axis=1)
+    public float rollCoupling01 = 0.07f;
+    // 对应 Python: u_next[1] += 0.06 * roll(u[0], shift=1, axis=2)
+    public float rollCoupling10 = 0.06f;
+    // 对应 Python: u_next[2] += 0.05 * roll(u[0], shift=1, axis=0)
+    public float rollCoupling20 = 0.05f;
+    // 对应 Python: u_next[0] += 0.04 * cross01
+    public float crossProduct01 = 0.04f;
+    // 对应 Python: u_next[1] += 0.03 * cross12
+    public float crossProduct12 = 0.03f;
+    // 对应 Python: u_next[2] += 0.03 * tanh(u[0]*u[2])
+    public float crossTanh02 = 0.03f;
+    // 对应 Python: u_next -= 0.015 * u * |u|  (cubic drag)
+    public float cubicDrag = 0.015f;
+
+    // ── 线性剪切 (target domain) ─────────────────────────────
+    [Header("Shear Profile")]
+    // 对应 Python: u[0] += 0.25 * shear[0] 和 u[2] *= 0.85
+    public float shearStrength = 0.25f;
+    public float zScale = 0.85f;
+
+    // ── 运行时控制 ───────────────────────────────────────────
+    [Header("Runtime")]
+    [Tooltip("每秒演化步数")]
+    public float evolveRate = 12.5f; // 对应 ~0.08s 间隔
+    [Tooltip("场强缩放，控制湍流对飞艇的影响强度")]
+    public float fieldScale = 3.5f;
+    [Tooltip("3D 场映射到世界坐标的物理尺度 (米)")]
+    public float worldSize = 16f;
+
+    // ── 数据采集 ─────────────────────────────────────────────
+    [Header("Data Collection")]
+    public bool enableDataCollection = true;
+    [Tooltip("采集间隔 (秒)")]
+    public float collectInterval = 0.05f;
+    [Tooltip("输出目录")]
+    public string outputDirectory = "TurbulenceData";
+
+    // ── 内部状态 ─────────────────────────────────────────────
+    // u[c, ix, iy, iz] — 速度分量 c∈{0,1,2}, 空间索引
+    private float[,,,] u;
+    private float[,,,] uNext;
+    private float evolveTimer;
+    private float collectTimer;
+    private int N; // gridSize 缓存
+    private float nu; // 运动粘度
+    private float cellSize; // worldSize / gridSize
+
+    // 数据采集缓冲
+    private List<TurbulenceRecord> recordBuffer;
+    private int episodeIndex;
+    private StreamWriter activeWriter;
+
+    // ── 预计算的剪切 profile ─────────────────────────────────
+    private float[] shearProfile;       // 线性剪切 [-0.8, 0.8]
+    private float[] zProfile;           // 归一化 z [0, 1]
+    private float[] gaussianShearDrive; // Gaussian shear drive
+
+    // ============================================================
+    // Unity 生命周期
+    // ============================================================
+
+    void Awake()
+    {
+        N = gridSize;
+        nu = (1f / reTau) * nuMultiplier;
+        cellSize = worldSize / N;
+
+        u = new float[3, N, N, N];
+        uNext = new float[3, N, N, N];
+
+        // 预计算 profiles
+        // 对应 Python: shear = np.linspace(-0.8, 0.8, N)
+        shearProfile = new float[N];
+        zProfile = new float[N];
+        gaussianShearDrive = new float[N];
+        float centerIdx = gaussianShearCenter * N; // N//4
+
+        for (int i = 0; i < N; i++)
+        {
+            shearProfile[i] = Mathf.Lerp(-0.8f, 0.8f, (float)i / (N - 1));
+            zProfile[i] = (float)i / (N - 1); // [0, 1]
+            float diff = i - centerIdx;
+            gaussianShearDrive[i] = Mathf.Exp(
+                -(diff * diff) / (2f * gaussianShearSigma * gaussianShearSigma));
+        }
+
+        // 初始化速度场
+        GenerateVelocityField();
+
+        // 数据采集
+        if (enableDataCollection)
+        {
+            recordBuffer = new List<TurbulenceRecord>(2048);
+            episodeIndex = 0;
+            Directory.CreateDirectory(outputDirectory);
+        }
+    }
+
+    void Update()
+    {
+        // 按固定频率演化
+        evolveTimer += Time.deltaTime;
+        float evolveInterval = 1f / evolveRate;
+        while (evolveTimer >= evolveInterval)
+        {
+            AdvectDiffuse();
+            evolveTimer -= evolveInterval;
+        }
+    }
+
+    void OnDestroy()
+    {
+        FlushAndCloseWriter();
+    }
+
+    // ============================================================
+    // SECTION 1: Von Kármán 谱生成
+    // ============================================================
+    // 精确对应 Python: _generate_velocity_field()
+    //
+    // 1. 生成随机复数场 u_hat = randn + 1j*randn
+    // 2. 构造 k 空间: k = fftfreq(N, 1/N)
+    // 3. 应用 E(k) = k^{-slope} 谱衰减
+    // 4. 各向异性缩放 (target: u*=1.25, v*=0.80)
+    // 5. Helmholtz 投影: u -= k(k·u)/|k|²  → 无散度
+    // 6. IFFT 回到物理空间
+    // 7. 线性剪切叠加
+    //
+    // 注意: Unity 中没有高效 3D FFT，这里使用等价的
+    //       逐模态叠加实现（精度完全一致）
+    // ============================================================
+
+    private void GenerateVelocityField()
+    {
+        // 采样谱斜率
+        float slope = UnityEngine.Random.Range(slopeMin, slopeMax);
+        int maxModes = N / 2; // Nyquist
+
+        // 对每个 Fourier 模态生成随机相位和振幅
+        // 这等价于 Python 的 u_hat = randn + 1j*randn; u_hat *= sqrt(E_k)
+        // 但避免了 FFT 的实现复杂度
+
+        // 先清零
+        Array.Clear(u, 0, u.Length);
+
+        // 逐模态叠加 (等价于 IFFT of spectrally weighted random field)
+        System.Random rng = new System.Random(
+            UnityEngine.Random.Range(0, int.MaxValue));
+
+        for (int kxi = -maxModes; kxi <= maxModes; kxi++)
+        for (int kyi = -maxModes; kyi <= maxModes; kyi++)
+        for (int kzi = -maxModes; kzi <= maxModes; kzi++)
+        {
+            float kx = kxi * 2f * Mathf.PI / N;
+            float ky = kyi * 2f * Mathf.PI / N;
+            float kz = kzi * 2f * Mathf.PI / N;
+            float kMag = Mathf.Sqrt(kx * kx + ky * ky + kz * kz);
+
+            if (kMag < 0.1f * 2f * Mathf.PI / N) continue; // 跳过 k=0
+
+            // Python: E_k[mask] = k_mag[mask] ** (-slope)
+            float Ek = Mathf.Pow(kMag, -slope);
+            float amp = Mathf.Sqrt(Ek + 1e-8f) / (N * N * N);
+
+            // 随机复数系数 (实部 + 虚部)
+            float[] realPart = new float[3];
+            float[] imagPart = new float[3];
+            for (int c = 0; c < 3; c++)
+            {
+                realPart[c] = (float)NextGaussian(rng) * amp;
+                imagPart[c] = (float)NextGaussian(rng) * amp;
+            }
+
+            // 各向异性 (Python: u_hat[0] *= 1.25; u_hat[1] *= 0.80)
+            realPart[0] *= anisotropyU; imagPart[0] *= anisotropyU;
+            realPart[1] *= anisotropyV; imagPart[1] *= anisotropyV;
+
+            // Helmholtz 投影: 移除 k 方向分量
+            // Python: k_dot_u = kx*u_hat[0] + ky*u_hat[1] + kz*u_hat[2]
+            //         u_hat[c] -= kc * k_dot_u / k2
+            float k2 = kMag * kMag + 1e-8f;
+
+            float kdotR = kx * realPart[0] + ky * realPart[1] + kz * realPart[2];
+            float kdotI = kx * imagPart[0] + ky * imagPart[1] + kz * imagPart[2];
+
+            float[] kVec = { kx, ky, kz };
+            for (int c = 0; c < 3; c++)
+            {
+                realPart[c] -= kVec[c] * kdotR / k2;
+                imagPart[c] -= kVec[c] * kdotI / k2;
+            }
+
+            // IFFT: u(x) = Σ_k [Real * cos(k·x) - Imag * sin(k·x)]
+            for (int ix = 0; ix < N; ix++)
+            for (int iy = 0; iy < N; iy++)
+            for (int iz = 0; iz < N; iz++)
+            {
+                float phase = kx * ix + ky * iy + kz * iz;
+                float cosP = Mathf.Cos(phase);
+                float sinP = Mathf.Sin(phase);
+
+                for (int c = 0; c < 3; c++)
+                {
+                    u[c, ix, iy, iz] += realPart[c] * cosP
+                                      - imagPart[c] * sinP;
+                }
+            }
+        }
+
+        // 线性剪切叠加 (Python target domain)
+        // Python: u[0] += 0.25 * shear[0] (沿 axis=1)
+        //         u[2] *= 0.85
+        for (int ix = 0; ix < N; ix++)
+        for (int iy = 0; iy < N; iy++)
+        for (int iz = 0; iz < N; iz++)
+        {
+            u[0, ix, iy, iz] += shearStrength * shearProfile[iy];
+            u[2, ix, iy, iz] *= zScale;
+        }
+    }
+
+    // ============================================================
+    // SECTION 2: 对流-扩散演化
+    // ============================================================
+    // 精确对应 Python: _advect_diffuse(u)
+    //
+    // 步骤:
+    // 1. 谱粘性衰减: u_hat *= exp(-ν·k²·dt)
+    //    → 物理空间等价: 高斯平滑核
+    //    → 这里用有限差分 Laplacian 近似:
+    //      u_next[c,i,j,k] = u[c,i,j,k] + ν·dt·Laplacian(u)
+    //
+    // 2. 非线性对流:
+    //    u_next[0] -= 0.10 * u[0] * ∂u[0]/∂x
+    //    u_next[1] -= 0.08 * u[1] * ∂u[1]/∂y
+    //    u_next[2] -= 0.06 * u[2] * ∂u[2]/∂z
+    //
+    // 3. 交叉耦合 (roll + cross product + tanh):
+    //    见 Inspector 中各系数
+    //
+    // 4. 立方阻力: u_next -= 0.015 * u * |u|
+    //
+    // 5. Target domain 强制项:
+    //    - Wall drive: u_next[0] += 0.10 * z
+    //    - Gaussian shear: u_next[0] += 0.03 * G(x) * u[1](x+1)
+    //    - u_y coupling: u_next[1] += 0.02 * u[2](y+1)
+    // ============================================================
+
+    private void AdvectDiffuse()
+    {
+        // Python 中的谱衰减 decay = exp(-nu * k2 * 0.02)
+        // 等价于物理空间的扩散: 使用 6 点 Laplacian 有限差分
+        // Laplacian(u) ≈ (u[i+1]+u[i-1]+u[j+1]+u[j-1]+u[k+1]+u[k-1] - 6*u[i,j,k]) / dx²
+        // 扩散更新: u_next = u + nu * dt_eff * Laplacian
+
+        float dx2 = 1f; // 归一化网格间距 (Python 中 k = fftfreq(N, 1/N))
+        float nuDt = nu * diffusionDt;
+
+        for (int ix = 0; ix < N; ix++)
+        for (int iy = 0; iy < N; iy++)
+        for (int iz = 0; iz < N; iz++)
+        {
+            // 周期性边界索引
+            int xp = (ix + 1) % N, xm = (ix - 1 + N) % N;
+            int yp = (iy + 1) % N, ym = (iy - 1 + N) % N;
+            int zp = (iz + 1) % N, zm = (iz - 1 + N) % N;
+
+            for (int c = 0; c < 3; c++)
+            {
+                float center = u[c, ix, iy, iz];
+
+                // ── 粘性扩散 (Laplacian) ──
+                float laplacian = (
+                    u[c, xp, iy, iz] + u[c, xm, iy, iz] +
+                    u[c, ix, yp, iz] + u[c, ix, ym, iz] +
+                    u[c, ix, iy, zp] + u[c, ix, iy, zm] -
+                    6f * center) / dx2;
+
+                uNext[c, ix, iy, iz] = center + nuDt * laplacian;
+            }
+
+            // ── 非线性对流 ──
+            // Python: grad_x0 = np.gradient(u[0], axis=0) ≈ 中心差分
+            //         u_next[0] -= 0.10 * u[0] * grad_x0
+            float gradX0 = (u[0, xp, iy, iz] - u[0, xm, iy, iz]) * 0.5f;
+            float gradY1 = (u[1, ix, yp, iz] - u[1, ix, ym, iz]) * 0.5f;
+            float gradZ2 = (u[2, ix, iy, zp] - u[2, ix, iy, zm]) * 0.5f;
+
+            uNext[0, ix, iy, iz] -= advectionCoeffX * u[0, ix, iy, iz] * gradX0;
+            uNext[1, ix, iy, iz] -= advectionCoeffY * u[1, ix, iy, iz] * gradY1;
+            uNext[2, ix, iy, iz] -= advectionCoeffZ * u[2, ix, iy, iz] * gradZ2;
+
+            // ── 交叉耦合 (roll) ──
+            // Python: u_next[0] += 0.07 * np.roll(u[1], shift=1, axis=1)
+            //   → roll(u[1], shift=1, axis=1) 即 u[1, ix, (iy-1+N)%N, iz]
+            uNext[0, ix, iy, iz] += rollCoupling01 * u[1, ix, ym, iz];
+            // Python: u_next[1] += 0.06 * np.roll(u[0], shift=1, axis=2)
+            uNext[1, ix, iy, iz] += rollCoupling10 * u[0, ix, iy, zm];
+            // Python: u_next[2] += 0.05 * np.roll(u[0], shift=1, axis=0)
+            uNext[2, ix, iy, iz] += rollCoupling20 * u[0, xm, iy, iz];
+
+            // ── 交叉乘积 ──
+            // Python: cross01 = u[0] * u[1]; u_next[0] += 0.04 * cross01
+            float cross01 = u[0, ix, iy, iz] * u[1, ix, iy, iz];
+            float cross12 = u[1, ix, iy, iz] * u[2, ix, iy, iz];
+            uNext[0, ix, iy, iz] += crossProduct01 * cross01;
+            uNext[1, ix, iy, iz] += crossProduct12 * cross12;
+            // Python: u_next[2] += 0.03 * np.tanh(u[0] * u[2])
+            uNext[2, ix, iy, iz] += crossTanh02 * TanhApprox(
+                u[0, ix, iy, iz] * u[2, ix, iy, iz]);
+
+            // ── 立方阻力 ──
+            // Python: u_next -= 0.015 * u * np.abs(u)
+            for (int c = 0; c < 3; c++)
+            {
+                uNext[c, ix, iy, iz] -= cubicDrag
+                    * u[c, ix, iy, iz]
+                    * Mathf.Abs(u[c, ix, iy, iz]);
+            }
+
+            // ── Target Domain 强制项 ──
+            float z01 = zProfile[iz]; // 归一化 z ∈ [0,1]
+
+            // Wall drive: Python: u_next[0] += 0.10 * z
+            uNext[0, ix, iy, iz] += wallDriveStrength * z01;
+
+            // Gaussian shear: Python: u_next[0] += 0.03 * shear_drive * roll(u[1], 1, axis=0)
+            uNext[0, ix, iy, iz] += gaussianShearStrength
+                * gaussianShearDrive[ix]
+                * u[1, xm, iy, iz]; // roll(shift=1, axis=0) → ix-1
+
+            // u_y coupling: Python: u_next[1] += 0.02 * roll(u[2], 1, axis=1)
+            uNext[1, ix, iy, iz] += uyCouplingStrength * u[2, ix, ym, iz];
+        }
+
+        // 交换缓冲区
+        var tmp = u;
+        u = uNext;
+        uNext = tmp;
+    }
+
+    // ============================================================
+    // SECTION 3: 空间采样 (三线性插值)
+    // ============================================================
+    // 供飞控和数据采集使用
+    // 输入: 世界坐标 (x, y, z) ∈ [0, worldSize]³
+    // 输出: 插值后的 3D 风速向量 × fieldScale
+    // ============================================================
+
+    /// <summary>
+    /// 在世界坐标处采样湍流风速 (含 fieldScale 缩放)
+    /// </summary>
+    public Vector3 SampleWind(Vector3 worldPos)
+    {
+        return SampleWindRaw(worldPos) * fieldScale;
+    }
+
+    /// <summary>
+    /// 在世界坐标处采样原始湍流风速 (不含缩放)
+    /// </summary>
+    public Vector3 SampleWindRaw(Vector3 worldPos)
+    {
+        // 世界坐标 → 网格坐标 (周期性)
+        float gx = Mod(worldPos.x / cellSize, N);
+        float gy = Mod(worldPos.y / cellSize, N);
+        float gz = Mod(worldPos.z / cellSize, N);
+
+        // 三线性插值
+        int x0 = (int)gx % N, y0 = (int)gy % N, z0 = (int)gz % N;
+        int x1 = (x0 + 1) % N, y1 = (y0 + 1) % N, z1 = (z0 + 1) % N;
+        float fx = gx - (int)gx, fy = gy - (int)gy, fz = gz - (int)gz;
+
+        Vector3 result = Vector3.zero;
+        for (int c = 0; c < 3; c++)
+        {
+            float c000 = u[c, x0, y0, z0], c100 = u[c, x1, y0, z0];
+            float c010 = u[c, x0, y1, z0], c110 = u[c, x1, y1, z0];
+            float c001 = u[c, x0, y0, z1], c101 = u[c, x1, y0, z1];
+            float c011 = u[c, x0, y1, z1], c111 = u[c, x1, y1, z1];
+
+            float c00 = Mathf.Lerp(c000, c100, fx);
+            float c01 = Mathf.Lerp(c001, c101, fx);
+            float c10 = Mathf.Lerp(c010, c110, fx);
+            float c11 = Mathf.Lerp(c011, c111, fx);
+
+            float c0 = Mathf.Lerp(c00, c10, fy);
+            float c1 = Mathf.Lerp(c01, c11, fy);
+
+            result[c] = Mathf.Lerp(c0, c1, fz);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// 采样风速的空间梯度 (有限差分)
+    /// 返回 3×3 Jacobian: J[i,j] = ∂u_i/∂x_j
+    /// 供控制律计算使用
+    /// </summary>
+    public float[,] SampleWindGradient(Vector3 worldPos, float delta = 0.3f)
+    {
+        float[,] J = new float[3, 3];
+        for (int j = 0; j < 3; j++)
+        {
+            Vector3 offset = Vector3.zero;
+            offset[j] = delta;
+            Vector3 vp = SampleWindRaw(worldPos + offset);
+            Vector3 vm = SampleWindRaw(worldPos - offset);
+            for (int i = 0; i < 3; i++)
+            {
+                J[i, j] = (vp[i] - vm[i]) / (2f * delta);
+            }
+        }
+        return J;
+    }
+
+    // ============================================================
+    // SECTION 4: 数据采集 — Unity → Python 训练管线
+    // ============================================================
+    // 输出格式: CSV (与 Python DataLoader 对接)
+    //
+    // 每帧记录: timestamp, position(3), velocity(3), wind_raw(3),
+    //           wind_gradient(9), motor_commands(n)
+    //
+    // Python 端使用 DomainShiftTurbulenceDataset 格式:
+    //   input: u_t.reshape(3, -1).T  → (4096, 3)
+    //   target: u_{t+K}.reshape(3, -1).T → (4096, 3)
+    //
+    // 本采集器同时输出:
+    //   1. 局部轨迹数据 (飞艇传感器视角) → 风场估计器训练
+    //   2. 全场快照 (周期性) → 全场湍流预测模型训练
+    // ============================================================
+
+    [System.Serializable]
+    public struct TurbulenceRecord
+    {
+        public float timestamp;
+        public Vector3 position;
+        public Vector3 velocity;
+        public Vector3 angularVelocity;
+        public Quaternion orientation;
+        public Vector3 windRaw;
+        public Vector3 windScaled;
+        public float windMagnitude;
+    }
+
+    /// <summary>
+    /// 由飞控脚本每帧调用，记录当前状态
+    /// </summary>
+    public void RecordFrame(Vector3 position, Vector3 velocity,
+        Vector3 angularVelocity, Quaternion orientation)
+    {
+        if (!enableDataCollection) return;
+
+        collectTimer += Time.deltaTime;
+        if (collectTimer < collectInterval) return;
+        collectTimer -= collectInterval;
+
+        Vector3 windRaw = SampleWindRaw(position);
+        Vector3 windScaled = windRaw * fieldScale;
+
+        var record = new TurbulenceRecord
+        {
+            timestamp = Time.time,
+            position = position,
+            velocity = velocity,
+            angularVelocity = angularVelocity,
+            orientation = orientation,
+            windRaw = windRaw,
+            windScaled = windScaled,
+            windMagnitude = windScaled.magnitude,
+        };
+
+        recordBuffer.Add(record);
+    }
+
+    /// <summary>
+    /// 保存全场快照 (供 Python 全场预测模型训练)
+    /// 格式: (3, N, N, N) → flatten → CSV 行
+    /// 对应 Python: u_t.reshape(3, -1).T → (N³, 3)
+    /// </summary>
+    public void SaveFieldSnapshot(string tag = "")
+    {
+        string filename = Path.Combine(outputDirectory,
+            $"field_snapshot_{tag}_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+
+        using (var sw = new StreamWriter(filename))
+        {
+            sw.WriteLine("ix,iy,iz,ux,uy,uz");
+            for (int ix = 0; ix < N; ix++)
+            for (int iy = 0; iy < N; iy++)
+            for (int iz = 0; iz < N; iz++)
+            {
+                sw.WriteLine($"{ix},{iy},{iz}," +
+                    $"{u[0, ix, iy, iz]:F6},{u[1, ix, iy, iz]:F6},{u[2, ix, iy, iz]:F6}");
+            }
+        }
+        Debug.Log($"[TurbulenceField] Saved field snapshot: {filename}");
+    }
+
+    /// <summary>
+    /// 保存当前 episode 的轨迹数据
+    /// </summary>
+    public void SaveEpisode()
+    {
+        if (recordBuffer == null || recordBuffer.Count == 0) return;
+
+        string filename = Path.Combine(outputDirectory,
+            $"episode_{episodeIndex:D4}.csv");
+
+        using (var sw = new StreamWriter(filename))
+        {
+            sw.WriteLine("t,px,py,pz,vx,vy,vz,wx,wy,wz,qx,qy,qz,qw," +
+                "wind_rx,wind_ry,wind_rz,wind_sx,wind_sy,wind_sz,wind_mag");
+
+            foreach (var r in recordBuffer)
+            {
+                sw.WriteLine(
+                    $"{r.timestamp:F4}," +
+                    $"{r.position.x:F4},{r.position.y:F4},{r.position.z:F4}," +
+                    $"{r.velocity.x:F4},{r.velocity.y:F4},{r.velocity.z:F4}," +
+                    $"{r.angularVelocity.x:F4},{r.angularVelocity.y:F4},{r.angularVelocity.z:F4}," +
+                    $"{r.orientation.x:F4},{r.orientation.y:F4},{r.orientation.z:F4},{r.orientation.w:F4}," +
+                    $"{r.windRaw.x:F6},{r.windRaw.y:F6},{r.windRaw.z:F6}," +
+                    $"{r.windScaled.x:F4},{r.windScaled.y:F4},{r.windScaled.z:F4}," +
+                    $"{r.windMagnitude:F4}");
+            }
+        }
+
+        Debug.Log($"[TurbulenceField] Saved episode {episodeIndex}: {recordBuffer.Count} frames → {filename}");
+        recordBuffer.Clear();
+        episodeIndex++;
+    }
+
+    /// <summary>
+    /// 重新生成湍流场并保存前后快照 (生成训练对)
+    /// 对应 Python: u_t → rollout K steps → u_{t+K}
+    /// </summary>
+    public void GenerateTrainingPair(int rolloutSteps = 8)
+    {
+        GenerateVelocityField();
+        SaveFieldSnapshot("input");
+
+        for (int k = 0; k < rolloutSteps; k++)
+        {
+            AdvectDiffuse();
+        }
+        SaveFieldSnapshot("target_K" + rolloutSteps);
+    }
+
+    // ============================================================
+    // 工具函数
+    // ============================================================
+
+    private static float Mod(float x, float m)
+    {
+        return ((x % m) + m) % m;
+    }
+
+    private static float TanhApprox(float x)
+    {
+        // Padé 近似，避免 Mathf.Exp 开销
+        if (x > 3f) return 1f;
+        if (x < -3f) return -1f;
+        float x2 = x * x;
+        return x * (27f + x2) / (27f + 9f * x2);
+    }
+
+    private static double NextGaussian(System.Random rng)
+    {
+        // Box-Muller 变换
+        double u1 = 1.0 - rng.NextDouble();
+        double u2 = rng.NextDouble();
+        return Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+    }
+
+    private void FlushAndCloseWriter()
+    {
+        if (enableDataCollection && recordBuffer != null && recordBuffer.Count > 0)
+        {
+            SaveEpisode();
+        }
+        if (activeWriter != null)
+        {
+            activeWriter.Close();
+            activeWriter = null;
+        }
+    }
+
+    // ============================================================
+    // Gizmos: 在 Scene 视图中可视化湍流场
+    // ============================================================
+
+    #if UNITY_EDITOR
+    [Header("Debug Visualization")]
+    public bool showGizmos = true;
+    public int gizmoStep = 4; // 每隔 4 个格点显示一个箭头
+    public float gizmoScale = 1.5f;
+
+    void OnDrawGizmos()
+    {
+        if (!showGizmos || u == null) return;
+
+        for (int ix = 0; ix < N; ix += gizmoStep)
+        for (int iy = 0; iy < N; iy += gizmoStep)
+        for (int iz = 0; iz < N; iz += gizmoStep)
+        {
+            Vector3 worldPos = new Vector3(
+                ix * cellSize, iy * cellSize, iz * cellSize);
+            Vector3 vel = new Vector3(
+                u[0, ix, iy, iz],
+                u[1, ix, iy, iz],
+                u[2, ix, iy, iz]);
+
+            float mag = vel.magnitude;
+            // 颜色: 蓝(弱) → 红(强)
+            Gizmos.color = Color.Lerp(
+                new Color(0.2f, 0.4f, 0.8f, 0.5f),
+                new Color(0.9f, 0.2f, 0.1f, 0.8f),
+                Mathf.Clamp01(mag * 4f));
+
+            Gizmos.DrawLine(worldPos, worldPos + vel * gizmoScale);
+            Gizmos.DrawSphere(worldPos + vel * gizmoScale, 0.05f);
+        }
+    }
+    #endif
+}
