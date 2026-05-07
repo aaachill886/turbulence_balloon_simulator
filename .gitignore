@@ -5,6 +5,7 @@
 [Bb]uild/
 [Bb]uilds/
 [Ll]ogs/
+[Ll]ogs_AI/
 [Uu]ser[Ss]ettings/
 
 # Visual Studio cache
@@ -47,3 +48,11 @@ sysinfo.txt
 # Crash logs
 sysinfo.txt
 crashlytics-build.properties
+
+# Project specific - exclude
+*.bat
+*.mp4
+*.avi
+*.mov
+TurbulenceFieldPhysical.cs.txt
+REFACTOR_PLAN.md
