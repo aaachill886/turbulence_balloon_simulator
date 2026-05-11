@@ -11,6 +11,9 @@ namespace BalloonSim.Sim
             if (Object.FindObjectOfType<GameController>() != null)
                 return;
 
+            // 允许后台运行（用于数据采集）
+            Application.runInBackground = true;
+
             var cfg = ScriptableObject.CreateInstance<SimulationConfig>();
             cfg.aiEnabled = true; // default to control-assist mode
 
@@ -153,6 +156,25 @@ namespace BalloonSim.Sim
             log.observationBuffer = obs;
 
             ui.logger = log;
+
+            var trainLogGo = new GameObject("TrainingDataLogger");
+            trainLogGo.transform.SetParent(root.transform);
+            var trainLog = trainLogGo.AddComponent<TrainingDataLogger>();
+            trainLog.config = cfg;
+            trainLog.balloon = balloon;
+            trainLog.field = field;
+            trainLog.observationBuffer = obs;
+            trainLog.enableLogging = false;
+
+            var explorerGo = new GameObject("ExplorationAgent");
+            explorerGo.transform.SetParent(root.transform);
+            var explorer = explorerGo.AddComponent<RandomExplorationAgent>();
+            explorer.config = cfg;
+            explorer.balloon = balloon;
+            explorer.game = game;
+            explorer.field = field;
+            explorer.trainingLogger = trainLog;
+            explorer.enabled = false;
         }
     }
 }

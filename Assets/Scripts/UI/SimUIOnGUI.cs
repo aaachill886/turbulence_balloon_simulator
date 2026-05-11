@@ -16,6 +16,8 @@ namespace BalloonSim.UI
         private bool _showAdv;
         private Vector2 _basicScroll;
         private Vector2 _advScroll;
+        private Vector2 _topScroll;
+        private bool _confirmClearTraining;
 
         private void Awake()
         {
@@ -47,7 +49,8 @@ namespace BalloonSim.UI
 
             if (config == null || balloon == null) return;
 
-            GUILayout.BeginArea(new Rect(10, 10, 860, 270), GUI.skin.box);
+            GUILayout.BeginArea(new Rect(10, 10, 980, 300), GUI.skin.box);
+            _topScroll = GUILayout.BeginScrollView(_topScroll, GUILayout.Width(960), GUILayout.Height(280));
             GUILayout.Label($"mode: {(config.aiEnabled ? "assist" : "manual")}  predictor:{(config.enableAIPredictor ? "ai" : "baseline")}");
             GUILayout.Label($"pos: {balloon.transform.position.x:F1}, {balloon.transform.position.y:F1}, {balloon.transform.position.z:F1}");
             GUILayout.Label($"vel: {balloon.velocity.x:F1}, {balloon.velocity.y:F1}, {balloon.velocity.z:F1}");
@@ -80,6 +83,46 @@ namespace BalloonSim.UI
             if (GUILayout.Button("Tornado")) config.tornado = !config.tornado;
             GUILayout.EndHorizontal();
 
+            var explorer = FindObjectOfType<RandomExplorationAgent>();
+            var trainLog = FindObjectOfType<TrainingDataLogger>();
+            if (explorer != null && trainLog != null)
+            {
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button(explorer.enabled ? "Stop Exploration" : "Start Exploration"))
+                {
+                    explorer.enabled = !explorer.enabled;
+                    if (explorer.enabled) trainLog.ResumeLogging();
+                    else trainLog.PauseLogging();
+                }
+
+                if (GUILayout.Button(trainLog.IsPaused ? "Resume Training" : "Pause Training"))
+                {
+                    if (trainLog.IsPaused) trainLog.ResumeLogging();
+                    else trainLog.PauseLogging();
+                }
+
+                if (GUILayout.Button("New Episode"))
+                {
+                    trainLog.FlushEpisode();
+                    trainLog.StartNewEpisode();
+                }
+
+                if (GUILayout.Button(_confirmClearTraining ? "Confirm Clear Training" : "Clear Training Data"))
+                {
+                    if (!_confirmClearTraining) _confirmClearTraining = true;
+                    else
+                    {
+                        trainLog.ClearAllTrainingData();
+                        _confirmClearTraining = false;
+                    }
+                }
+
+                if (GUILayout.Button("Cancel Clear")) _confirmClearTraining = false;
+
+                GUILayout.Label($"Episode: {trainLog.EpisodeIndex} | Frames: {trainLog.TotalFramesLogged} | {(trainLog.IsPaused ? "paused" : "recording")}");
+                GUILayout.EndHorizontal();
+            }
+
             if (logger != null)
             {
                 GUILayout.BeginHorizontal();
@@ -90,6 +133,7 @@ namespace BalloonSim.UI
                 GUILayout.EndHorizontal();
             }
 
+            GUILayout.EndScrollView();
             GUILayout.EndArea();
 
             if (_showBasic)

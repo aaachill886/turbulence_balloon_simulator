@@ -152,6 +152,13 @@ namespace BalloonSim.Sim
             if (Input.GetKeyDown(KeyCode.LeftBracket)) ToggleAI(false);
             if (Input.GetKeyDown(KeyCode.RightBracket)) ToggleAI(true);
             if (Input.GetKeyDown(KeyCode.R)) ResetAll();
+
+            var explorer = FindObjectOfType<RandomExplorationAgent>();
+            if (explorer != null && explorer.IsExploring)
+            {
+                UserTargetVel = explorer.ExplorationTargetVel;
+                UserActive = true;
+            }
         }
 
         private void UpdateAttitude(float dt, Vector3 desiredVel)
