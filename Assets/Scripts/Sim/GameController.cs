@@ -9,6 +9,7 @@ namespace BalloonSim.Sim
         public TurbulenceField field;
         public BalloonState balloon;
         public AutopilotController autopilot;
+        public Stage3PolicyRunner stage3Policy;
         public BlockWorld world;
         public ObservationBuffer observationBuffer;
 
@@ -23,6 +24,8 @@ namespace BalloonSim.Sim
 
         public Vector3 UserTargetVel { get; private set; }
         public bool UserActive { get; private set; }
+        public Vector3 LastDesiredVel { get; private set; }
+        public Vector3 LastAcceleration { get; private set; }
 
         private void Awake()
         {
@@ -59,10 +62,9 @@ namespace BalloonSim.Sim
             {
                 balloon.transform.position = new Vector3(8f, 8f, 8f);
                 balloon.velocity = Vector3.zero;
+                LastDesiredVel = Vector3.zero;
+                LastAcceleration = Vector3.zero;
             }
-
-            config.aiEnabled = true;
-            config.tornado = false;
 
             if (field != null)
                 field.Generate();
@@ -100,8 +102,11 @@ namespace BalloonSim.Sim
                 ? autopilot.ComputeControl(UserTargetVel, UserActive, dt)
                 : UserTargetVel;
 
+            LastDesiredVel = UserTargetVel;
+            Vector3 prevVel = balloon.velocity;
             balloon.velocity = Vector3.Lerp(balloon.velocity, desiredVel, Mathf.Clamp01(dt * 5f));
             balloon.velocity = Vector3.ClampMagnitude(balloon.velocity, 4f);
+            LastAcceleration = dt > 1e-6f ? (balloon.velocity - prevVel) / dt : Vector3.zero;
 
             UpdateAttitude(dt, desiredVel);
 
@@ -134,13 +139,22 @@ namespace BalloonSim.Sim
 
             float spd = config.throttle * config.throttle * config.manualSpeedScale;
 
-            if (raw.sqrMagnitude > 1e-6f)
+            bool hasManualInput = raw.sqrMagnitude > 1e-6f;
+            if (hasManualInput)
             {
                 Vector3 localDir = raw.normalized;
                 Transform frame = inputFrame != null ? inputFrame : (Camera.main != null ? Camera.main.transform : null);
                 Vector3 worldDir = frame != null ? (frame.rotation * localDir) : localDir;
 
                 UserTargetVel = worldDir * spd;
+
+                if (config != null && config.aiEnabled && stage3Policy != null && stage3Policy.TryPredictAction(out var policyVel))
+                {
+                    float blend = 0.35f;
+                    UserTargetVel = Vector3.Lerp(UserTargetVel, policyVel, blend);
+                    LastDesiredVel = policyVel;
+                }
+
                 UserActive = true;
             }
             else
@@ -158,7 +172,11 @@ namespace BalloonSim.Sim
             {
                 UserTargetVel = explorer.ExplorationTargetVel;
                 UserActive = true;
+                return;
             }
+
+            // Stage3 policy only assists active player movement. With no WASD/J/K input,
+            // keep UserActive=false so Stage2/Control Assist can hold the last safe pose.
         }
 
         private void UpdateAttitude(float dt, Vector3 desiredVel)

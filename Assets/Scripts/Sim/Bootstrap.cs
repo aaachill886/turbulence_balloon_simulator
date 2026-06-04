@@ -16,6 +16,18 @@ namespace BalloonSim.Sim
 
             var cfg = ScriptableObject.CreateInstance<SimulationConfig>();
             cfg.aiEnabled = true; // default to control-assist mode
+            // Default mixed-condition scene for Stage2 data collection
+            cfg.beaufort = 9.5f;
+            cfg.gustStrength = 10.5f;
+            cfg.gustDirDeg = 35f;
+            cfg.convectionStrength = 7.5f;
+            cfg.tornado = true;
+            cfg.viscosity = 0.85f;
+            cfg.reynolds = 28000f;
+            cfg.randomStrength = 3.5f;
+            cfg.wakeStrength = 2.5f;
+            cfg.densityRatio = 1.0f;
+            cfg.waypointSpawnMode = 2f;
 
             var root = new GameObject("BalloonSim");
 
@@ -28,6 +40,7 @@ namespace BalloonSim.Sim
             var balloonSync = balloonGo.AddComponent<BalloonVisualSync>();
             balloonSync.config = cfg;
             var thermo = balloonGo.AddComponent<BalloonThermodynamics>();
+            thermo.startupWarmupSeconds = 12f;
 
             var waypointGo = GameObject.CreatePrimitive(PrimitiveType.Sphere);
             waypointGo.name = "Waypoint";
@@ -94,7 +107,26 @@ namespace BalloonSim.Sim
             var onnxGo = new GameObject("ONNXPredictor");
             onnxGo.transform.SetParent(root.transform);
             var onnx = onnxGo.AddComponent<ONNXPredictor>();
-            onnx.enableONNX = false;
+            onnx.enableONNX = true;
+            onnx.useNormalization = true;
+            onnx.normParamsPath = "norm_params.json";
+            onnx.modelResourcePath = "wind_predictor";
+            onnx.Reinitialize();
+
+            var policyGo = new GameObject("Stage3PolicyRunner");
+            policyGo.transform.SetParent(root.transform);
+            var policy = policyGo.AddComponent<Stage3PolicyRunner>();
+            policy.enablePolicy = true;
+            policy.config = cfg;
+            policy.balloon = balloon;
+            policy.field = field;
+            policy.autopilot = ap;
+            policy.waypoint = waypointGo.transform;
+            policy.modelResourcePath = "Stage3/policy_net";
+            policy.streamingAssetsFolder = "Stage3";
+            policy.normFileName = "policy_norm.json";
+            policy.metaFileName = "policy_meta.json";
+            policy.Reinitialize();
 
             ap.observationBuffer = obs;
             ap.onnxPredictor = onnx;
@@ -108,9 +140,11 @@ namespace BalloonSim.Sim
             game.field = field;
             game.balloon = balloon;
             game.autopilot = ap;
+            game.stage3Policy = policy;
             game.world = world;
             game.inputFrame = camGo.transform;
             game.observationBuffer = obs;
+            policy.game = game;
 
             var heatGo = new GameObject("FlowHeatmap");
             heatGo.transform.SetParent(root.transform);
@@ -146,6 +180,7 @@ namespace BalloonSim.Sim
             var logGo = new GameObject("DataLogger");
             logGo.transform.SetParent(root.transform);
             var log = logGo.AddComponent<DataLogger>();
+            log.enabledLogging = false;
             log.config = cfg;
             log.balloon = balloon;
             log.field = field;
@@ -164,7 +199,12 @@ namespace BalloonSim.Sim
             trainLog.balloon = balloon;
             trainLog.field = field;
             trainLog.observationBuffer = obs;
-            trainLog.enableLogging = false;
+            trainLog.game = game;
+            trainLog.autopilot = ap;
+            trainLog.enableLogging = true;
+            trainLog.autoStartOnEnable = false;
+            trainLog.logMode = TrainingDataLogger.LogMode.TrainingData;
+            trainLog.trainingDataDirectory = "training_data";
 
             var explorerGo = new GameObject("ExplorationAgent");
             explorerGo.transform.SetParent(root.transform);
@@ -174,7 +214,7 @@ namespace BalloonSim.Sim
             explorer.game = game;
             explorer.field = field;
             explorer.trainingLogger = trainLog;
-            explorer.enabled = false;
+            explorer.explorationEnabled = false;
         }
     }
 }

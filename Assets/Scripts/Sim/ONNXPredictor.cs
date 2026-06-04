@@ -1,10 +1,8 @@
 using System;
 using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
 using UnityEngine;
-
-#if ENABLE_SENTIS
-using Unity.Sentis;
-#endif
 
 namespace BalloonSim.Sim
 {
@@ -17,25 +15,28 @@ namespace BalloonSim.Sim
 
         [Header("Model")]
         public UnityEngine.Object onnxModelAsset;
+        [Tooltip("StreamingAssets subfolder that contains policy_meta.json / policy_norm.json.")]
+        public string streamingAssetsStage3Folder = "Stage3";
+        [Tooltip("Optional Resources path for the imported Sentis ModelAsset (without extension).")]
+        public string modelResourcePath = "wind_predictor";
         public string muOutputName = "mu";
         public string logVarOutputName = "logvar";
 
         [Header("Output Auto-Detect")]
         public bool autoDetectOutputNames = true;
-        [Tooltip("Comma separated candidates, first match wins")]
-        public string muCandidates = "mu,mean,pred,velocity,output";
-        [Tooltip("Comma separated candidates, first match wins")]
-        public string logVarCandidates = "logvar,log_var,var,variance,sigma,std";
+        public bool verboseInferenceDiagnostics = false;
 
         [Header("Input Spec")]
-        [Tooltip("Model history length K. Input will be left-padded if history < K.")]
         public int modelHistoryLength = 8;
-        [Tooltip("Model spatial sample count N. Current ObservationBuffer uses 27 (3x3x3).")]
         public int modelSpatialSamples = 27;
 
         [Header("Heuristic fallback")]
         [Range(0f, 2f)] public float trendGain = 0.28f;
         [Range(0.1f, 3f)] public float sigmaScale = 1f;
+
+        [Header("Normalization")]
+        public bool useNormalization = true;
+        public string normParamsPath = "policy_norm.json";
 
         public bool IsModelAvailable { get; private set; }
         public Vector3 LastMu { get; private set; }
@@ -43,77 +44,143 @@ namespace BalloonSim.Sim
         public float LastInferenceMs { get; private set; }
         public string RuntimeMode { get; private set; } = "off";
         public string LastStatusMessage { get; private set; } = "init";
+        public string LastModelSource { get; private set; } = "n/a";
+        public string LastNormSource { get; private set; } = "n/a";
 
-#if ENABLE_SENTIS
-        private Model _model;
-        private IWorker _worker;
-#endif
+        private Vector3 _windMean = Vector3.zero;
+        private Vector3 _windStd = Vector3.one;
+
+        // Sentis reflection handles
+        private bool _sentisAvailable;
+        private Type _modelAssetType;
+        private Type _modelLoaderType;
+        private Type _workerFactoryType;
+        private Type _backendTypeType;
+        private Type _tensorFloatType;
+        private Type _tensorShapeType;
+        private object _model;
+        private object _worker;
 
         private void Awake()
         {
+            Reinitialize();
+        }
+
+        public void Reinitialize()
+        {
+            DisposeWorker();
+            _model = null;
+            IsModelAvailable = false;
+            LoadNormalizationParams();
+            ProbeSentis();
             TryInitModel();
         }
 
         private void OnDestroy()
         {
-#if ENABLE_SENTIS
-            _worker?.Dispose();
-            _worker = null;
-#endif
+            DisposeWorker();
         }
 
-        [ContextMenu("Validate ONNX Bindings")]
-        public void ValidateBindings()
+        private void ProbeSentis()
         {
-            if (!enableONNX)
+            _modelAssetType = ResolveType("Unity.Sentis.ModelAsset");
+            _modelLoaderType = ResolveType("Unity.Sentis.ModelLoader");
+            _workerFactoryType = ResolveType("Unity.Sentis.Worker") ?? ResolveType("Unity.Sentis.WorkerFactory");
+            _backendTypeType = ResolveType("Unity.Sentis.BackendType");
+            _tensorFloatType = ResolveType("Unity.Sentis.Tensor`1")?.MakeGenericType(typeof(float)) ?? ResolveType("Unity.Sentis.Tensor") ?? ResolveType("Unity.Sentis.TensorFloat");
+            _tensorShapeType = ResolveType("Unity.Sentis.TensorShape");
+
+            _sentisAvailable = _modelAssetType != null && _modelLoaderType != null && _workerFactoryType != null &&
+                               _backendTypeType != null && _tensorFloatType != null && _tensorShapeType != null;
+
+            if (!_sentisAvailable)
             {
-                LastStatusMessage = "ONNX disabled";
-                LogDiag(LastStatusMessage);
+                string sentisAssemblies = string.Join(", ", AppDomain.CurrentDomain.GetAssemblies()
+                    .Select(a => a.GetName().Name)
+                    .Where(n => n.IndexOf("Sentis", StringComparison.OrdinalIgnoreCase) >= 0));
+                LogDiag($"Sentis reflection probe failed; fallback mode only. Assemblies=[{sentisAssemblies}] " +
+                        $"ModelAsset={_modelAssetType != null} ModelLoader={_modelLoaderType != null} " +
+                        $"WorkerFactory={_workerFactoryType != null} BackendType={_backendTypeType != null} " +
+                        $"TensorFloat={_tensorFloatType != null} TensorShape={_tensorShapeType != null}");
+            }
+        }
+
+        private static Type ResolveType(string fullName)
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var type = asm.GetType(fullName, false);
+                if (type != null)
+                    return type;
+            }
+            return null;
+        }
+
+        private void LoadNormalizationParams()
+        {
+            if (!useNormalization)
+            {
+                _windMean = Vector3.zero;
+                _windStd = Vector3.one;
+                LastNormSource = "disabled";
                 return;
             }
 
-#if ENABLE_SENTIS
-            if (!IsModelAvailable || _worker == null)
+            string stage3Root = System.IO.Path.Combine(Application.streamingAssetsPath, string.IsNullOrWhiteSpace(streamingAssetsStage3Folder) ? "Stage3" : streamingAssetsStage3Folder);
+            string normPath = System.IO.Path.Combine(stage3Root, normParamsPath);
+            if (System.IO.File.Exists(normPath))
             {
-                LastStatusMessage = "Model runtime unavailable";
-                LogDiag(LastStatusMessage);
-                return;
-            }
-
-            int k = Mathf.Max(1, modelHistoryLength);
-            int n = Mathf.Max(1, modelSpatialSamples);
-            int c = 3;
-
-            try
-            {
-                using var test = new TensorFloat(new TensorShape(1, k, n, c), new float[k * n * c]);
-                _worker.Schedule(test);
-
-                if (autoDetectOutputNames)
-                    AutoResolveOutputNames();
-
-                var muTensor = _worker.PeekOutput(muOutputName) as TensorFloat;
-                var lvTensor = _worker.PeekOutput(logVarOutputName) as TensorFloat;
-
-                if (muTensor == null || lvTensor == null)
+                try
                 {
-                    LastStatusMessage = $"Output missing: mu='{muOutputName}' or logvar='{logVarOutputName}'";
-                    LogDiag(LastStatusMessage);
+                    TryParseNormJson(System.IO.File.ReadAllText(normPath), normPath);
+                    LastNormSource = normPath;
                     return;
                 }
+                catch (Exception e)
+                {
+                    LogDiag("[WARN] Stage3 norm parse failed: " + e.Message);
+                }
+            }
 
-                LastStatusMessage = $"OK input=(1,{k},{n},{c}) mu='{muOutputName}'({muTensor.length}) logvar='{logVarOutputName}'({lvTensor.length})";
-                LogDiag(LastStatusMessage);
-            }
-            catch (Exception e)
+            var textAsset = Resources.Load<TextAsset>("norm_params");
+            if (textAsset != null)
             {
-                LastStatusMessage = "Validate failed: " + e.Message;
-                LogDiag(LastStatusMessage);
+                TryParseNormJson(textAsset.text, "Resources/norm_params");
+                LastNormSource = "Resources/norm_params";
+                return;
             }
-#else
-            LastStatusMessage = "ENABLE_SENTIS not defined";
-            LogDiag(LastStatusMessage);
-#endif
+
+            _windMean = Vector3.zero;
+            _windStd = Vector3.one;
+            LastNormSource = "identity";
+        }
+
+        [Serializable]
+        private class NormParams
+        {
+            public float[] wind_mean;
+            public float[] wind_std;
+            public float[] state_mean;
+            public float[] state_std;
+        }
+
+        private void TryParseNormJson(string json, string source)
+        {
+            var data = JsonUtility.FromJson<NormParams>(json);
+            if (data == null) throw new Exception("json parse returned null");
+
+            // Stage2 format: wind_mean/wind_std
+            if (data.wind_mean != null && data.wind_mean.Length >= 3)
+                _windMean = new Vector3(data.wind_mean[0], data.wind_mean[1], data.wind_mean[2]);
+            else
+                _windMean = Vector3.zero;
+
+            if (data.wind_std != null && data.wind_std.Length >= 3)
+                _windStd = new Vector3(Mathf.Max(1e-6f, data.wind_std[0]), Mathf.Max(1e-6f, data.wind_std[1]), Mathf.Max(1e-6f, data.wind_std[2]));
+            else
+                _windStd = Vector3.one;
+
+            LogDiag($"Loaded norm params from {source}: mean={_windMean}, std={_windStd}");
         }
 
         private void TryInitModel()
@@ -121,35 +188,195 @@ namespace BalloonSim.Sim
             IsModelAvailable = false;
             RuntimeMode = enableONNX ? "fallback" : "off";
 
-#if ENABLE_SENTIS
-            if (!enableONNX || onnxModelAsset == null)
+            if (!enableONNX)
             {
-                LastStatusMessage = !enableONNX ? "ONNX disabled" : "ModelAsset not assigned";
+                LastStatusMessage = "ONNX disabled";
                 return;
             }
 
-            if (onnxModelAsset is not ModelAsset ma)
+            if (onnxModelAsset == null && !string.IsNullOrWhiteSpace(modelResourcePath))
             {
-                LastStatusMessage = "Assigned object is not Sentis ModelAsset";
+                onnxModelAsset = LoadSentisModelAssetFromResources(modelResourcePath);
+                if (onnxModelAsset != null)
+                {
+                    LastModelSource = $"Resources/{modelResourcePath}";
+                    LogDiag($"Loaded model asset candidate from {LastModelSource}: type={onnxModelAsset.GetType().FullName}, name={onnxModelAsset.name}");
+                }
+                else
+                {
+                    LogDiag($"Unable to load Sentis ModelAsset from Resources/{modelResourcePath}");
+                }
+            }
+
+            if (onnxModelAsset == null)
+            {
+                LastStatusMessage = "ModelAsset not assigned";
+                return;
+            }
+
+            if (!_sentisAvailable)
+            {
+                LastStatusMessage = "Sentis unavailable, using fallback";
                 LogDiag(LastStatusMessage);
                 return;
             }
 
-            _model = ModelLoader.Load(ma);
-            _worker = WorkerFactory.CreateWorker(BackendType.GPUCompute, _model);
-            IsModelAvailable = _worker != null;
-            RuntimeMode = IsModelAvailable ? "onnx" : "fallback";
-            LastStatusMessage = IsModelAvailable ? "Model loaded" : "Worker create failed";
-            LogDiag(LastStatusMessage);
-
-            if (IsModelAvailable) ValidateBindings();
-#else
-            if (enableONNX)
+            if (!_modelAssetType.IsInstanceOfType(onnxModelAsset))
             {
-                LastStatusMessage = "ENABLE_SENTIS not defined, using fallback";
+                LogDiag($"Assigned object is not Sentis ModelAsset: actual={onnxModelAsset.GetType().FullName}, expected={_modelAssetType.FullName}; retrying Resources/{modelResourcePath}");
+                var resolved = LoadSentisModelAssetFromResources(modelResourcePath);
+                if (resolved != null && _modelAssetType.IsInstanceOfType(resolved))
+                {
+                    onnxModelAsset = resolved;
+                    LastModelSource = $"Resources/{modelResourcePath}";
+                    LogDiag($"Resolved Sentis ModelAsset from Resources/{modelResourcePath}: type={onnxModelAsset.GetType().FullName}, name={onnxModelAsset.name}");
+                }
+                else
+                {
+                    LastStatusMessage = $"Assigned object is not Sentis ModelAsset: actual={onnxModelAsset.GetType().FullName}, expected={_modelAssetType.FullName}";
+                    LogDiag(LastStatusMessage);
+                    return;
+                }
+            }
+
+            try
+            {
+                var loadMethod = _modelLoaderType.GetMethod("Load", BindingFlags.Public | BindingFlags.Static, null, new[] { _modelAssetType }, null);
+                if (loadMethod == null)
+                {
+                    LastStatusMessage = "ModelLoader.Load(ModelAsset) not found";
+                    LogDiag(LastStatusMessage);
+                    return;
+                }
+
+                _model = loadMethod.Invoke(null, new[] { onnxModelAsset });
+                LogDiag($"Sentis model loaded: type={_model?.GetType().FullName ?? "null"}");
+
+                _worker = CreateSentisWorker(_model);
+                if (_worker == null)
+                {
+                    LastStatusMessage = "Sentis worker creation failed";
+                    return;
+                }
+
+                IsModelAvailable = _worker != null;
+                RuntimeMode = IsModelAvailable ? "onnx" : "fallback";
+                LastStatusMessage = IsModelAvailable ? "Model loaded" : "Worker create failed";
+                LastModelSource = onnxModelAsset.name;
+                LogDiag($"Sentis init result: available={IsModelAvailable}, worker={_worker?.GetType().FullName ?? "null"}, status={LastStatusMessage}");
+            }
+            catch (Exception e)
+            {
+                IsModelAvailable = false;
+                RuntimeMode = "fallback";
+                LastStatusMessage = "Sentis init failed: " + e.Message;
                 LogDiag(LastStatusMessage);
+            }
+        }
+
+        private UnityEngine.Object LoadSentisModelAssetFromResources(string resourcePath)
+        {
+            UnityEngine.Object loaded = Resources.Load(resourcePath);
+            if (loaded != null && _modelAssetType != null && _modelAssetType.IsInstanceOfType(loaded))
+                return loaded;
+
+            if (loaded != null)
+                LogDiag($"Resources.Load('{resourcePath}') returned {loaded.GetType().FullName}; trying imported sub-assets");
+
+            UnityEngine.Object[] all = Resources.LoadAll(resourcePath);
+            foreach (var asset in all)
+            {
+                if (asset == null) continue;
+                LogDiag($"Resources.LoadAll('{resourcePath}') candidate: type={asset.GetType().FullName}, name={asset.name}");
+                if (_modelAssetType != null && _modelAssetType.IsInstanceOfType(asset))
+                    return asset;
+            }
+
+            string dir = System.IO.Path.GetDirectoryName(resourcePath)?.Replace('\\', '/');
+            string file = System.IO.Path.GetFileName(resourcePath);
+            UnityEngine.Object[] dirAssets = Resources.LoadAll(string.IsNullOrWhiteSpace(dir) ? string.Empty : dir);
+            foreach (var asset in dirAssets)
+            {
+                if (asset == null || asset.name != file) continue;
+                LogDiag($"Resources.LoadAll('{dir}') named candidate: type={asset.GetType().FullName}, name={asset.name}");
+                if (_modelAssetType != null && _modelAssetType.IsInstanceOfType(asset))
+                    return asset;
+            }
+
+#if UNITY_EDITOR
+            string assetPath = $"Assets/Resources/{resourcePath}.onnx";
+            UnityEngine.Object editorAsset = UnityEditor.AssetDatabase.LoadAssetAtPath(assetPath, _modelAssetType ?? typeof(UnityEngine.Object));
+            if (editorAsset != null)
+            {
+                LogDiag($"AssetDatabase.LoadAssetAtPath('{assetPath}') candidate: type={editorAsset.GetType().FullName}, name={editorAsset.name}");
+                if (_modelAssetType != null && _modelAssetType.IsInstanceOfType(editorAsset))
+                    return editorAsset;
+            }
+
+            foreach (var asset in UnityEditor.AssetDatabase.LoadAllAssetsAtPath(assetPath))
+            {
+                if (asset == null) continue;
+                LogDiag($"AssetDatabase.LoadAllAssetsAtPath('{assetPath}') candidate: type={asset.GetType().FullName}, name={asset.name}");
+                if (_modelAssetType != null && _modelAssetType.IsInstanceOfType(asset))
+                    return asset;
             }
 #endif
+
+            return null;
+        }
+
+        private object CreateSentisWorker(object model)
+        {
+            try
+            {
+                if (_workerFactoryType != null && _workerFactoryType.FullName == "Unity.Sentis.Worker")
+                {
+                    object backend = TryParseBackend("GPUCompute") ?? TryParseBackend("GPUCommandBuffer") ?? TryParseBackend("GPUPixel") ?? TryParseBackend("CPU");
+                    foreach (var ctor in _workerFactoryType.GetConstructors(BindingFlags.Public | BindingFlags.Instance))
+                    {
+                        var ps = ctor.GetParameters();
+                        LogDiag($"Worker ctor candidate: ({string.Join(", ", ps.Select(p => p.ParameterType.FullName))})");
+                        try
+                        {
+                            if (ps.Length == 2 && ps[0].ParameterType.IsInstanceOfType(model) && ps[1].ParameterType == _backendTypeType && backend != null)
+                                return ctor.Invoke(new[] { model, backend });
+                            if (ps.Length == 2 && ps[0].ParameterType == _backendTypeType && ps[1].ParameterType.IsInstanceOfType(model) && backend != null)
+                                return ctor.Invoke(new[] { backend, model });
+                            if (ps.Length == 1 && ps[0].ParameterType.IsInstanceOfType(model))
+                                return ctor.Invoke(new[] { model });
+                        }
+                        catch (Exception e)
+                        {
+                            LogDiag("Worker ctor invoke failed: " + e.Message);
+                        }
+                    }
+                    LogDiag("No compatible Unity.Sentis.Worker constructor found");
+                }
+
+                var method = _workerFactoryType?.GetMethod("CreateWorker", BindingFlags.Public | BindingFlags.Static);
+                if (method != null)
+                {
+                    object backend = TryParseBackend("GPUCompute") ?? TryParseBackend("CPU");
+                    return method.Invoke(null, new[] { backend, model });
+                }
+            }
+            catch (Exception e)
+            {
+                LogDiag("CreateSentisWorker failed: " + e.Message);
+            }
+            return null;
+        }
+
+        private object TryParseBackend(string name)
+        {
+            try
+            {
+                return Enum.Parse(_backendTypeType, name);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         public bool TryPredict(ObservationBuffer.ObservationFrame[] history, out Vector3 mu, out float sigma)
@@ -164,62 +391,16 @@ namespace BalloonSim.Sim
                 return false;
             }
 
-#if ENABLE_SENTIS
-            if (IsModelAvailable && _worker != null)
+            if (IsModelAvailable && _worker != null && TrySentisPredict(history, out mu, out sigma))
             {
-                if (history == null || history.Length == 0)
-                    return false;
-
-                int k = Mathf.Max(1, modelHistoryLength);
-                int n = Mathf.Max(1, modelSpatialSamples);
-                int c = 3;
-
-                float[] input = new float[1 * k * n * c];
-                FillInput(history, input, k, n);
-
-                var sw = Stopwatch.StartNew();
-                using var x = new TensorFloat(new TensorShape(1, k, n, c), input);
-                _worker.Schedule(x);
-
-                if (autoDetectOutputNames)
-                    AutoResolveOutputNames();
-
-                var muTensor = _worker.PeekOutput(muOutputName) as TensorFloat;
-                var lvTensor = _worker.PeekOutput(logVarOutputName) as TensorFloat;
-                sw.Stop();
-                LastInferenceMs = (float)sw.Elapsed.TotalMilliseconds;
-
-                if (muTensor == null || lvTensor == null)
-                {
-                    LastStatusMessage = "Output tensor missing, fallback used";
-                    RuntimeMode = "fallback";
-                    return false;
-                }
-
-                float mx = muTensor[0];
-                float my = muTensor.length > 1 ? muTensor[1] : 0f;
-                float mz = muTensor.length > 2 ? muTensor[2] : 0f;
-
-                float lvx = lvTensor[0];
-                float lvy = lvTensor.length > 1 ? lvTensor[1] : lvx;
-                float lvz = lvTensor.length > 2 ? lvTensor[2] : lvx;
-
-                float sv = Mathf.Sqrt(Mathf.Exp((lvx + lvy + lvz) / 3f));
-                mu = new Vector3(mx, my, mz);
-                sigma = Mathf.Max(1e-4f, sv);
-
-                LastMu = mu;
-                LastSigma = sigma;
                 RuntimeMode = "onnx";
                 LastStatusMessage = "ONNX inference OK";
+                LastMu = mu;
+                LastSigma = sigma;
                 return true;
             }
-#endif
 
-            if (!fallbackToHeuristicWhenUnavailable)
-                return false;
-
-            if (history == null || history.Length < 2)
+            if (!fallbackToHeuristicWhenUnavailable || history == null || history.Length < 2)
                 return false;
 
             int nHist = history.Length;
@@ -231,29 +412,20 @@ namespace BalloonSim.Sim
             for (int i = s; i < nHist; i++)
             {
                 int wi = Mathf.Min(i - s, 4);
-                Vector3 centerWind = history[i].windSamples != null && history[i].windSamples.Length > 13
-                    ? history[i].windSamples[13]
-                    : Vector3.zero;
+                Vector3 centerWind = history[i].windSamples != null && history[i].windSamples.Length > 13 ? history[i].windSamples[13] : Vector3.zero;
                 p += centerWind * w[wi];
                 wsSum += w[wi];
             }
-
             if (wsSum > 1e-6f) p /= wsSum;
 
-            Vector3 last = history[nHist - 1].windSamples != null && history[nHist - 1].windSamples.Length > 13
-                ? history[nHist - 1].windSamples[13]
-                : Vector3.zero;
-            Vector3 prev = history[nHist - 2].windSamples != null && history[nHist - 2].windSamples.Length > 13
-                ? history[nHist - 2].windSamples[13]
-                : Vector3.zero;
+            Vector3 last = history[nHist - 1].windSamples != null && history[nHist - 1].windSamples.Length > 13 ? history[nHist - 1].windSamples[13] : Vector3.zero;
+            Vector3 prev = history[nHist - 2].windSamples != null && history[nHist - 2].windSamples.Length > 13 ? history[nHist - 2].windSamples[13] : Vector3.zero;
             p += (last - prev) * trendGain;
 
             float var = 0f;
             for (int i = s; i < nHist; i++)
             {
-                Vector3 centerWind = history[i].windSamples != null && history[i].windSamples.Length > 13
-                    ? history[i].windSamples[13]
-                    : Vector3.zero;
+                Vector3 centerWind = history[i].windSamples != null && history[i].windSamples.Length > 13 ? history[i].windSamples[13] : Vector3.zero;
                 Vector3 d = centerWind - p;
                 var += d.sqrMagnitude;
             }
@@ -263,9 +435,95 @@ namespace BalloonSim.Sim
             sigma = Mathf.Sqrt(var + 1e-6f) * sigmaScale;
             LastMu = mu;
             LastSigma = sigma;
-            RuntimeMode = "fallback";
-            LastStatusMessage = "Heuristic fallback used";
+            RuntimeMode = IsModelAvailable ? "onnx" : "fallback";
+            if (!IsModelAvailable)
+                LastStatusMessage = "Heuristic fallback used";
             return true;
+        }
+
+        private bool TrySentisPredict(ObservationBuffer.ObservationFrame[] history, out Vector3 mu, out float sigma)
+        {
+            mu = Vector3.zero;
+            sigma = 1f;
+            if (history == null || history.Length == 0 || _worker == null || _tensorShapeType == null || _tensorFloatType == null)
+            {
+                if (verboseInferenceDiagnostics)
+                    LogDiag($"TrySentisPredict skipped: history={history?.Length ?? -1}, worker={_worker != null}, tensorShape={_tensorShapeType != null}, tensor={_tensorFloatType != null}");
+                return false;
+            }
+
+            try
+            {
+                int k = Mathf.Max(1, modelHistoryLength);
+                int n = Mathf.Max(1, modelSpatialSamples);
+                int c = 3;
+                float[] input = new float[k * n * c];
+                FillInput(history, input, k, n);
+
+                object shape = CreateTensorShape(1, k, n, c);
+                object tensor = CreateTensor(shape, input);
+                if (shape == null || tensor == null)
+                {
+                    LastStatusMessage = "Sentis tensor creation failed";
+                    return false;
+                }
+
+                var sw = Stopwatch.StartNew();
+                bool scheduled = InvokeWorkerSchedule(tensor);
+                if (!scheduled)
+                {
+                    DisposeIfNeeded(tensor);
+                    LastStatusMessage = "Sentis worker schedule failed";
+                    if (verboseInferenceDiagnostics) LogDiag(LastStatusMessage);
+                    return false;
+                }
+
+                object muTensor = PeekOutput(muOutputName);
+                object lvTensor = PeekOutput(logVarOutputName);
+                float[] muArr = TensorToArray(muTensor, 3);
+                float[] lvArr = TensorToArray(lvTensor, 3);
+                sw.Stop();
+                LastInferenceMs = (float)sw.Elapsed.TotalMilliseconds;
+
+                DisposeIfNeeded(tensor);
+
+                if (muArr == null || muArr.Length < 3)
+                {
+                    LastStatusMessage = "Sentis mu output read failed";
+                    if (verboseInferenceDiagnostics) LogDiag(LastStatusMessage);
+                    return false;
+                }
+
+                if (useNormalization)
+                {
+                    mu = new Vector3(
+                        muArr[0] * _windStd.x + _windMean.x,
+                        muArr[1] * _windStd.y + _windMean.y,
+                        muArr[2] * _windStd.z + _windMean.z);
+                }
+                else
+                {
+                    mu = new Vector3(muArr[0], muArr[1], muArr[2]);
+                }
+
+                if (lvArr != null && lvArr.Length >= 3)
+                {
+                    float sv = Mathf.Sqrt(Mathf.Exp((lvArr[0] + lvArr[1] + lvArr[2]) / 3f));
+                    sigma = Mathf.Max(1e-4f, sv * _windStd.magnitude / Mathf.Sqrt(3f));
+                }
+                else
+                {
+                    sigma = 1f;
+                }
+
+                return true;
+            }
+            catch (Exception e)
+            {
+                LastStatusMessage = "Sentis inference failed: " + e.Message;
+                LogDiag(LastStatusMessage);
+                return false;
+            }
         }
 
         private void FillInput(ObservationBuffer.ObservationFrame[] history, float[] input, int k, int n)
@@ -273,69 +531,218 @@ namespace BalloonSim.Sim
             int startHist = Mathf.Max(0, history.Length - k);
             int padCount = k - (history.Length - startHist);
             int idx = 0;
+            Vector3[] firstSamples = history[startHist].windSamples;
 
             for (int t = 0; t < k; t++)
             {
-                int src = t < padCount ? startHist : startHist + (t - padCount);
-                src = Mathf.Clamp(src, 0, history.Length - 1);
-                var ws = history[src].windSamples;
-
+                int srcIndex = t < padCount ? startHist : startHist + (t - padCount);
+                Vector3[] samples = history[srcIndex].windSamples ?? firstSamples;
                 for (int i = 0; i < n; i++)
                 {
-                    Vector3 v = (ws != null && ws.Length > i) ? ws[i] : Vector3.zero;
-                    input[idx++] = v.x;
-                    input[idx++] = v.y;
-                    input[idx++] = v.z;
+                    Vector3 v = samples != null && i < samples.Length ? samples[i] : Vector3.zero;
+                    if (useNormalization)
+                    {
+                        input[idx++] = (v.x - _windMean.x) / _windStd.x;
+                        input[idx++] = (v.y - _windMean.y) / _windStd.y;
+                        input[idx++] = (v.z - _windMean.z) / _windStd.z;
+                    }
+                    else
+                    {
+                        input[idx++] = v.x;
+                        input[idx++] = v.y;
+                        input[idx++] = v.z;
+                    }
                 }
             }
         }
 
-#if ENABLE_SENTIS
-        private void AutoResolveOutputNames()
+        private object CreateTensorShape(params int[] dims)
         {
-            string resolvedMu = ResolveFirstExistingOutputName(muOutputName, muCandidates);
-            string resolvedLv = ResolveFirstExistingOutputName(logVarOutputName, logVarCandidates);
-
-            if (!string.IsNullOrEmpty(resolvedMu) && resolvedMu != muOutputName)
+            foreach (var ctor in _tensorShapeType.GetConstructors(BindingFlags.Public | BindingFlags.Instance))
             {
-                muOutputName = resolvedMu;
-                LogDiag($"Auto-detected mu output: {muOutputName}");
+                var ps = ctor.GetParameters();
+                try
+                {
+                    if (ps.Length == dims.Length && ps.All(p => p.ParameterType == typeof(int)))
+                        return ctor.Invoke(dims.Cast<object>().ToArray());
+                    if (ps.Length == 1 && ps[0].ParameterType == typeof(int[]))
+                        return ctor.Invoke(new object[] { dims });
+                }
+                catch { }
             }
-            if (!string.IsNullOrEmpty(resolvedLv) && resolvedLv != logVarOutputName)
-            {
-                logVarOutputName = resolvedLv;
-                LogDiag($"Auto-detected logvar output: {logVarOutputName}");
-            }
+            if (verboseInferenceDiagnostics) LogDiag("No compatible TensorShape constructor found");
+            return null;
         }
 
-        private string ResolveFirstExistingOutputName(string primary, string candidatesCsv)
+        private object CreateTensor(object shape, float[] data)
         {
-            if (TryHasOutput(primary)) return primary;
-
-            if (string.IsNullOrWhiteSpace(candidatesCsv)) return null;
-            string[] cands = candidatesCsv.Split(',');
-            foreach (string raw in cands)
+            var candidates = new[]
             {
-                string name = raw.Trim();
-                if (string.IsNullOrEmpty(name)) continue;
-                if (TryHasOutput(name)) return name;
+                ResolveType("Unity.Sentis.Tensor`1")?.MakeGenericType(typeof(float)),
+                ResolveType("Unity.Sentis.TensorFloat"),
+                _tensorFloatType,
+            }.Where(t => t != null).Distinct().ToArray();
+
+            foreach (var tensorType in candidates)
+            {
+                foreach (var ctor in tensorType.GetConstructors(BindingFlags.Public | BindingFlags.Instance))
+                {
+                    var ps = ctor.GetParameters();
+                    if (verboseInferenceDiagnostics)
+                        LogDiag($"Tensor ctor candidate {tensorType.FullName}: ({string.Join(", ", ps.Select(p => p.ParameterType.FullName))})");
+                    try
+                    {
+                        if (ps.Length >= 2 && ps[0].ParameterType.IsInstanceOfType(shape) && ps[1].ParameterType == typeof(float[]))
+                        {
+                            object[] args = ps.Select(p => p.HasDefaultValue ? p.DefaultValue : null).ToArray();
+                            args[0] = shape;
+                            args[1] = data;
+                            return ctor.Invoke(args);
+                        }
+                        if (ps.Length >= 2 && ps[0].ParameterType == typeof(float[]) && ps[1].ParameterType.IsInstanceOfType(shape))
+                        {
+                            object[] args = ps.Select(p => p.HasDefaultValue ? p.DefaultValue : null).ToArray();
+                            args[0] = data;
+                            args[1] = shape;
+                            return ctor.Invoke(args);
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        if (verboseInferenceDiagnostics) LogDiag("Tensor ctor invoke failed: " + e.Message);
+                    }
+                }
+            }
+
+            var dataType = ResolveType("Unity.Sentis.DataType");
+            object floatType = null;
+            if (dataType != null)
+            {
+                foreach (var name in new[] { "Float", "Float32" })
+                {
+                    try { floatType = Enum.Parse(dataType, name); break; } catch { }
+                }
+            }
+
+            foreach (var method in _tensorFloatType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+            {
+                if (!method.Name.Contains("From") && !method.Name.Contains("Create")) continue;
+                var ps = method.GetParameters();
+                if (verboseInferenceDiagnostics)
+                    LogDiag($"Tensor static candidate {method.Name}: ({string.Join(", ", ps.Select(p => p.ParameterType.FullName))})");
+                try
+                {
+                    if (ps.Length == 2 && ps[0].ParameterType.IsInstanceOfType(shape) && ps[1].ParameterType == typeof(float[]))
+                        return method.Invoke(null, new object[] { shape, data });
+                    if (ps.Length == 2 && ps[0].ParameterType == typeof(float[]) && ps[1].ParameterType.IsInstanceOfType(shape))
+                        return method.Invoke(null, new object[] { data, shape });
+                    if (ps.Length == 3 && ps[0].ParameterType.IsInstanceOfType(shape) && ps[1].ParameterType == dataType && ps[2].ParameterType == typeof(float[]) && floatType != null)
+                        return method.Invoke(null, new object[] { shape, floatType, data });
+                }
+                catch (Exception e)
+                {
+                    if (verboseInferenceDiagnostics) LogDiag($"Tensor static {method.Name} failed: {e.Message}");
+                }
+            }
+
+            if (verboseInferenceDiagnostics) LogDiag("No compatible Tensor constructor found");
+            return null;
+        }
+
+        private bool InvokeWorkerSchedule(object tensor)
+        {
+            foreach (string methodName in new[] { "Schedule", "Execute" })
+            {
+                foreach (var method in _worker.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance).Where(m => m.Name == methodName))
+                {
+                    var ps = method.GetParameters();
+                    try
+                    {
+                        if (ps.Length == 1 && ps[0].ParameterType.IsInstanceOfType(tensor))
+                        {
+                            method.Invoke(_worker, new[] { tensor });
+                            return true;
+                        }
+                        if (ps.Length == 2 && ps[0].ParameterType == typeof(string) && ps[1].ParameterType.IsInstanceOfType(tensor))
+                        {
+                            method.Invoke(_worker, new object[] { "wind_history", tensor });
+                            return true;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        if (verboseInferenceDiagnostics) LogDiag($"Worker {methodName} invoke failed: {e.Message}");
+                    }
+                }
+            }
+            return false;
+        }
+
+        private object PeekOutput(string outputName)
+        {
+            foreach (string methodName in new[] { "PeekOutput", "CopyOutput" })
+            {
+                var method = _worker.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                    .FirstOrDefault(m => m.Name == methodName && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
+                if (method == null) continue;
+                try { return method.Invoke(_worker, new object[] { outputName }); }
+                catch (Exception e) { LogDiag($"{methodName}('{outputName}') failed: {e.Message}"); }
             }
             return null;
         }
 
-        private bool TryHasOutput(string outputName)
+        private float[] TensorToArray(object tensor, int minLen)
         {
+            if (tensor == null) return null;
+            foreach (string methodName in new[] { "DownloadToArray", "ToReadOnlyArray", "ReadbackAndClone" })
+            {
+                var method = tensor.GetType().GetMethod(methodName, BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+                if (method == null) continue;
+                try
+                {
+                    object result = method.Invoke(tensor, null);
+                    if (result is float[] arr) return arr;
+                    if (result != null && result.GetType().IsArray && result.GetType().GetElementType() == typeof(float))
+                        return ((Array)result).Cast<float>().ToArray();
+                }
+                catch (Exception e)
+                {
+                    LogDiag($"Tensor {methodName} failed: {e.Message}");
+                }
+            }
+
+            var indexer = tensor.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(p => p.GetIndexParameters().Length == 1 && p.GetIndexParameters()[0].ParameterType == typeof(int));
+            if (indexer != null)
+            {
+                try
+                {
+                    float[] arr = new float[minLen];
+                    for (int i = 0; i < minLen; i++) arr[i] = Convert.ToSingle(indexer.GetValue(tensor, new object[] { i }));
+                    return arr;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        private void DisposeIfNeeded(object obj)
+        {
+            try { obj?.GetType().GetMethod("Dispose", BindingFlags.Public | BindingFlags.Instance)?.Invoke(obj, null); }
+            catch { }
+        }
+
+        private void DisposeWorker()
+        {
+            if (_worker == null) return;
             try
             {
-                var t = _worker.PeekOutput(outputName);
-                return t != null;
+                var m = _worker.GetType().GetMethod("Dispose", BindingFlags.Public | BindingFlags.Instance);
+                m?.Invoke(_worker, null);
             }
-            catch
-            {
-                return false;
-            }
+            catch { }
+            _worker = null;
         }
-#endif
 
         private void LogDiag(string msg)
         {

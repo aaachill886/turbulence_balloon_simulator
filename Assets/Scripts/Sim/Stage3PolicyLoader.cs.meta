@@ -1,10 +1,9 @@
 fileFormatVersion: 2
-guid: 3c8c538de3201714884b6292dffadd56
+guid: b13a8b43278f1f443a6611d549d66a74
 MonoImporter:
   externalObjects: {}
   serializedVersion: 2
-  defaultReferences:
-  - onnxModelAsset: {fileID: 102900000, guid: 20d79ad85f28b564593d25f44ab4b3dd, type: 3}
+  defaultReferences: []
   executionOrder: 0
   icon: {instanceID: 0}
   userData: 

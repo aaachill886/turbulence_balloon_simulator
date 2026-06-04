@@ -21,8 +21,10 @@ namespace BalloonSim.Sim
 
         public Vector3 Predicted { get; private set; }
         public float PredErr { get; private set; }
+        public float PredMSE { get; private set; }
         public float PredSigma { get; private set; }
         public float ThrottleNeed { get; private set; }
+        public Vector3 LastCommandVel { get; private set; }
         public Vector3 HoldForwardTarget => _safeForward;
 
         public void ResetState()
@@ -34,7 +36,9 @@ namespace BalloonSim.Sim
             _holdIy = 0f;
             _wasUser = false;
             Predicted = Vector3.zero;
+            LastCommandVel = Vector3.zero;
             PredErr = 0f;
+            PredMSE = 0f;
             PredSigma = 1f;
             ThrottleNeed = 0f;
         }
@@ -54,6 +58,7 @@ namespace BalloonSim.Sim
             if (_hist.Count < 3)
             {
                 PredSigma = 1f;
+                PredMSE = 0f;
                 return Vector3.zero;
             }
 
@@ -116,6 +121,8 @@ namespace BalloonSim.Sim
                 PushHistory(u);
                 ThrottleNeed = 0f;
                 PredErr = 0f;
+                PredMSE = (p - u).sqrMagnitude / 3f;
+                LastCommandVel = baseVel;
                 return baseVel;
             }
 
@@ -134,13 +141,18 @@ namespace BalloonSim.Sim
 
                 holdVel.y += _holdIy * config.holdAltIK;
 
+                if (thermodynamics != null)
+                    holdVel.y -= buoy;
+
                 holdVel = Vector3.ClampMagnitude(holdVel, config.holdMaxSpeed);
 
                 if (config.strictHoldNoDrift)
                 {
                     ThrottleNeed = holdVel.magnitude;
                     PredErr = (p - u).magnitude / (u.magnitude + 1e-6f);
+                    PredMSE = (p - u).sqrMagnitude / 3f;
                     PushHistory(u);
+                    LastCommandVel = holdVel;
                     return holdVel;
                 }
 
@@ -149,12 +161,18 @@ namespace BalloonSim.Sim
                 {
                     Vector3 envEstimated = new Vector3(p.x * fl, p.y * fl + buoy, p.z * fl);
                     Vector3 envForComp = config.assistUseOracleEnvCancellation ? envMeasured : envEstimated;
-                    assistHold -= envForComp * Mathf.Clamp01(config.holdEnvComp);
+                    float compGain = Mathf.Clamp01(config.holdEnvComp);
+                    if (!config.assistUseOracleEnvCancellation && config.usePredSigmaConfidence)
+                        compGain *= Mathf.Lerp(1f, 0.35f, Mathf.Clamp01(PredSigma / 2.0f));
+                    assistHold -= envForComp * compGain;
                 }
+                assistHold = Vector3.ClampMagnitude(assistHold, config.holdMaxSpeed);
 
                 ThrottleNeed = assistHold.magnitude;
                 PredErr = (p - u).magnitude / (u.magnitude + 1e-6f);
+                PredMSE = (p - u).sqrMagnitude / 3f;
                 PushHistory(u);
+                LastCommandVel = assistHold;
                 return assistHold;
             }
 
@@ -174,15 +192,22 @@ namespace BalloonSim.Sim
             float need = Mathf.Clamp(wn + distTerm - flowAlong - velAlong * config.aiSafeVelK, 0f,
                 config.throttle * config.throttle * config.aiNeedK);
 
-            float uncertGain = Mathf.Lerp(1f, 0.4f, Mathf.Clamp01(PredSigma / 0.7f));
-            need *= uncertGain;
+            if (config.usePredSigmaConfidence)
+            {
+                // Keep uncertainty as a soft attenuation, not a hard suppression.
+                float uncertGain = Mathf.Lerp(1f, 0.75f, Mathf.Clamp01(PredSigma / 2.0f));
+                need *= uncertGain;
+            }
 
             ThrottleNeed = need;
             Vector3 assist = wdir * need;
 
             PredErr = (p - u).magnitude / (u.magnitude + 1e-6f);
+            PredMSE = (p - u).sqrMagnitude / 3f;
             PushHistory(u);
-            return baseVel + assist;
+            Vector3 command = baseVel + assist;
+            LastCommandVel = command;
+            return command;
         }
 
         private void PushHistory(Vector3 u)

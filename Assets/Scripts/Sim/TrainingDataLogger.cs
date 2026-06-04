@@ -6,10 +6,6 @@ using UnityEngine;
 
 namespace BalloonSim.Sim
 {
-    /// <summary>
-    /// 训练数据记录器 - 记录完整的 27 点空间风场
-    /// 输出格式: t(1) + pos(3) + vel(3) + wind_27×3(81) + grad(9) + config(11) = 108 列
-    /// </summary>
     public class TrainingDataLogger : MonoBehaviour
     {
         [Header("References")]
@@ -17,16 +13,28 @@ namespace BalloonSim.Sim
         public BalloonState balloon;
         public TurbulenceField field;
         public ObservationBuffer observationBuffer;
+        public GameController game;
+        public AutopilotController autopilot;
+
+        public enum LogMode
+        {
+            TrainingData,
+            LogsAI
+        }
 
         [Header("Settings")]
         public bool enableLogging = true;
-        [Tooltip("采样间隔 (秒)")]
+        public bool autoStartOnEnable = false;
         public float sampleInterval = 0.08f;
-        [Tooltip("输出目录")]
-        public string outputDirectory = "training_data";
-        [Tooltip("每N行 flush")]
+        [Tooltip("Select which dataset stream to write.")]
+        public LogMode logMode = LogMode.TrainingData;
+        [Tooltip("Relative folder under project root for model-training episodes.")]
+        public string trainingDataDirectory = "training_data";
+        [Tooltip("Relative folder under project root for assistant/analysis episodes.")]
+        public string logsAIDirectory = "Logs_AI";
+        [Tooltip("Resolved absolute output directory (auto-managed from log mode).")]
+        public string outputDirectory = "Logs_AI";
         public int flushEvery = 50;
-        [Tooltip("空间采样间距 (m)")]
         public float sampleSpacing = 0.5f;
 
         private StreamWriter _writer;
@@ -42,28 +50,22 @@ namespace BalloonSim.Sim
         public int TotalFramesLogged => _lineCount;
         public bool IsPaused => _paused;
         public bool IsSessionOpen => _writer != null;
+        public bool CaptureEnabled { get; private set; } = true;
+        public string SamplePhase { get; private set; } = "warmup";
 
         private void OnEnable()
         {
-            if (!enableLogging) return;
+            if (!enableLogging || !autoStartOnEnable) return;
             InitializeOutputDirectory();
             DetectNextEpisodeIndex();
-            StartNewEpisode();
         }
 
-        private void OnDisable()
-        {
-            CloseWriter();
-        }
-
-        private void OnDestroy()
-        {
-            CloseWriter();
-        }
+        private void OnDisable() => CloseWriter();
+        private void OnDestroy() => CloseWriter();
 
         private void FixedUpdate()
         {
-            if (!enableLogging || _paused || _writer == null || balloon == null || field == null) return;
+            if (!enableLogging || !CaptureEnabled || _paused || _writer == null || balloon == null || field == null) return;
 
             _sampleTimer += Time.fixedDeltaTime;
             if (_sampleTimer < sampleInterval) return;
@@ -76,13 +78,6 @@ namespace BalloonSim.Sim
         {
             enableLogging = true;
             _paused = false;
-
-            if (_writer == null)
-            {
-                InitializeOutputDirectory();
-                DetectNextEpisodeIndex();
-                StartNewEpisode();
-            }
         }
 
         public void PauseLogging()
@@ -91,18 +86,46 @@ namespace BalloonSim.Sim
             _writer?.Flush();
         }
 
-        public void StartNewEpisode()
+        public void ResetEpisodeIndex()
+        {
+            _episodeIndex = 0;
+        }
+
+        public void CloseCurrentEpisode()
         {
             CloseWriter();
+            _lineCount = 0;
+            _sampleTimer = 0f;
+        }
 
+        public void SetCaptureEnabled(bool enabled)
+        {
+            CaptureEnabled = enabled;
+            SamplePhase = enabled ? "stable" : "transition";
+            if (!enabled)
+                _writer?.Flush();
+        }
+
+        public void SetSamplePhase(string phase)
+        {
+            SamplePhase = string.IsNullOrWhiteSpace(phase) ? "transition" : phase;
+        }
+
+        public void StartNewEpisode()
+        {
+            if (!enableLogging || _paused || !CaptureEnabled || SamplePhase != "stable")
+                return;
+
+            CloseWriter();
+            InitializeOutputDirectory();
+            Directory.CreateDirectory(outputDirectory);
             _currentPath = Path.Combine(outputDirectory, $"episode_{_episodeIndex:D4}.csv");
-
+            Directory.CreateDirectory(Path.GetDirectoryName(_currentPath));
             _writer = new StreamWriter(_currentPath, false, Encoding.UTF8);
             _writer.WriteLine(BuildHeader());
             _writer.Flush();
             _lineCount = 0;
             _sampleTimer = 0f;
-
             Debug.Log($"[TrainingDataLogger] Started episode {_episodeIndex} → {_currentPath}");
         }
 
@@ -137,36 +160,25 @@ namespace BalloonSim.Sim
             _sampleTimer = 0f;
             _paused = false;
 
-            if (enableLogging)
-                StartNewEpisode();
+            CaptureEnabled = false;
+            SamplePhase = "warmup";
         }
 
         private void WriteFrame()
         {
             Vector3 pos = balloon.transform.position;
-            Vector3 vel = balloon.velocity;
 
-            var sb = new StringBuilder(1024);
-
+            var sb = new StringBuilder(1536);
             sb.Append(F(Time.time));
-
-            sb.Append(','); sb.Append(F(pos.x));
-            sb.Append(','); sb.Append(F(pos.y));
-            sb.Append(','); sb.Append(F(pos.z));
-
-            sb.Append(','); sb.Append(F(vel.x));
-            sb.Append(','); sb.Append(F(vel.y));
-            sb.Append(','); sb.Append(F(vel.z));
+            sb.Append(','); sb.Append(SamplePhase);
+            AppendVec(sb, pos);
 
             for (int dx = -1; dx <= 1; dx++)
             for (int dy = -1; dy <= 1; dy++)
             for (int dz = -1; dz <= 1; dz++)
             {
                 Vector3 samplePos = pos + new Vector3(dx, dy, dz) * sampleSpacing;
-                Vector3 w = field.Sample(samplePos);
-                sb.Append(','); sb.Append(F(w.x));
-                sb.Append(','); sb.Append(F(w.y));
-                sb.Append(','); sb.Append(F(w.z));
+                AppendVec(sb, field.Sample(samplePos));
             }
 
             float[,] grad = field.SampleGradient(pos);
@@ -177,14 +189,8 @@ namespace BalloonSim.Sim
             }
 
             sb.Append(','); sb.Append(F(config.beaufort));
-            sb.Append(','); sb.Append(F(config.viscosity));
-            sb.Append(','); sb.Append(F(config.reynolds));
-            sb.Append(','); sb.Append(F(config.randomStrength));
             sb.Append(','); sb.Append(F(config.gustStrength));
-            sb.Append(','); sb.Append(F(config.gustDirDeg));
-            sb.Append(','); sb.Append(F(config.convectionStrength));
-            sb.Append(','); sb.Append(config.tornado ? "1" : "0");
-            sb.Append(','); sb.Append(F(config.wakeStrength));
+            sb.Append(','); sb.Append(F(config.viscosity));
             sb.Append(','); sb.Append(F(config.densityRatio));
             sb.Append(','); sb.Append(F(config.balloonRadius));
 
@@ -197,8 +203,8 @@ namespace BalloonSim.Sim
 
         private string BuildHeader()
         {
-            var sb = new StringBuilder(512);
-            sb.Append("t,pos_x,pos_y,pos_z,vel_x,vel_y,vel_z");
+            var sb = new StringBuilder(768);
+            sb.Append("t,samplePhase,pos_x,pos_y,pos_z");
 
             for (int dx = -1; dx <= 1; dx++)
             for (int dy = -1; dy <= 1; dy++)
@@ -212,16 +218,21 @@ namespace BalloonSim.Sim
             for (int j = 0; j < 3; j++)
                 sb.Append($",grad_{i}{j}");
 
-            sb.Append(",cfg_beaufort,cfg_viscosity,cfg_reynolds,cfg_randomStrength");
-            sb.Append(",cfg_gustStrength,cfg_gustDirDeg,cfg_convectionStrength");
-            sb.Append(",cfg_tornado,cfg_wakeStrength,cfg_densityRatio,cfg_balloonRadius");
-
+            sb.Append(",cfg_beaufort,cfg_gustStrength,cfg_viscosity,cfg_densityRatio,cfg_balloonRadius");
             return sb.ToString();
         }
 
         private void InitializeOutputDirectory()
         {
-            string fullPath = Path.Combine(Application.dataPath, "..", outputDirectory);
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            string relative;
+
+            // Stage2 capture is intentionally hard-routed to training_data.
+            // Stage3 policy logging uses DataLogger, not TrainingDataLogger.
+            logMode = LogMode.TrainingData;
+            relative = string.IsNullOrWhiteSpace(trainingDataDirectory) ? "training_data" : trainingDataDirectory;
+
+            string fullPath = Path.GetFullPath(Path.Combine(projectRoot, relative));
             Directory.CreateDirectory(fullPath);
             outputDirectory = fullPath;
         }
@@ -238,13 +249,11 @@ namespace BalloonSim.Sim
             var files = Directory.GetFiles(outputDirectory, "episode_*.csv");
             foreach (var f in files)
             {
-                string name = Path.GetFileNameWithoutExtension(f); // episode_0001
-                if (name.StartsWith("episode_", StringComparison.OrdinalIgnoreCase))
-                {
-                    string idx = name.Substring("episode_".Length);
-                    if (int.TryParse(idx, out int n) && n > maxIndex)
-                        maxIndex = n;
-                }
+                string name = Path.GetFileNameWithoutExtension(f);
+                if (!name.StartsWith("episode_", StringComparison.OrdinalIgnoreCase)) continue;
+                string idx = name.Substring("episode_".Length);
+                if (int.TryParse(idx, out int n) && n > maxIndex)
+                    maxIndex = n;
             }
 
             _episodeIndex = maxIndex + 1;
@@ -257,6 +266,23 @@ namespace BalloonSim.Sim
                 try { _writer.Flush(); _writer.Dispose(); } catch { }
                 _writer = null;
             }
+        }
+
+        private static void AppendVec(StringBuilder sb, Vector3 v)
+        {
+            sb.Append(','); sb.Append(F(v.x));
+            sb.Append(','); sb.Append(F(v.y));
+            sb.Append(','); sb.Append(F(v.z));
+        }
+
+        private static void AppendSixAxis(StringBuilder sb, Vector3 cmd)
+        {
+            sb.Append(','); sb.Append(F(Mathf.Max(0f, cmd.x)));
+            sb.Append(','); sb.Append(F(Mathf.Max(0f, -cmd.x)));
+            sb.Append(','); sb.Append(F(Mathf.Max(0f, cmd.y)));
+            sb.Append(','); sb.Append(F(Mathf.Max(0f, -cmd.y)));
+            sb.Append(','); sb.Append(F(Mathf.Max(0f, cmd.z)));
+            sb.Append(','); sb.Append(F(Mathf.Max(0f, -cmd.z)));
         }
 
         private static string F(float v)

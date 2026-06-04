@@ -51,6 +51,8 @@ namespace BalloonSim.Sim
         public bool aiEnabled = false;
         [Min(0f)] public float aiGain = 0.8f;
         [Min(0f)] public float ecoKeep = 0.35f;
+        [Tooltip("If ON, prediction uncertainty softly attenuates AI assistance")]
+        public bool usePredSigmaConfidence = true;
 
         [Header("Attitude")]
         [Range(30f, 360f)] public float attitudeMaxDegPerSec = 140f;

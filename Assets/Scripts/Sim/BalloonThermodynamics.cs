@@ -47,6 +47,8 @@ namespace BalloonSim.Sim
         [Header("Runtime State")]
         [Tooltip("当前气体质量 (kg)")]
         public float currentGasMass;
+        [Tooltip("启动后的热力学热身时间 (s)，热身完成前不建议开始自动探索或重启 episode")]
+        public float startupWarmupSeconds = 12f;
         [Tooltip("当前浮力 (N)")]
         public float currentBuoyancy;
         [Tooltip("当前重力 (N)")]
@@ -64,9 +66,12 @@ namespace BalloonSim.Sim
                 surfaceArea = 4f * Mathf.PI * Mathf.Pow(Mathf.Pow(volume * 3f / (4f * Mathf.PI), 1f / 3f), 2f);
         }
 
+        private float _startupTimer;
+
         private void FixedUpdate()
         {
             float dt = Time.fixedDeltaTime;
+            _startupTimer += dt;
             UpdateThermodynamics(dt);
         }
 
@@ -104,6 +109,8 @@ namespace BalloonSim.Sim
             // 7. 净升力
             netLift = currentBuoyancy - currentWeight;
         }
+
+        public bool IsWarmedUp => _startupTimer >= startupWarmupSeconds;
 
         /// <summary>
         /// 获取归一化浮力加速度 (m/s²)
