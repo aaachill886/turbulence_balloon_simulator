@@ -22,12 +22,13 @@ namespace BalloonSim.Sim
         public int flushEvery = 30;
 
         [Header("Stage 3 Metadata")]
-        [Tooltip("If ON, appends Stage 3 fields to the CSV without changing existing Stage 2 columns.")]
         public bool enableStage3Columns = true;
         public int episodeId = -1;
+        public int frameIndex = 0;
+        private int _currentEpisodeId = -1;
         public string runId = "";
-        [Tooltip("baseline / ai / manual / exploration")]
-        public string mode = "unknown";
+        [Tooltip("baseline / manual / exploration / policy")]
+        public string mode = "stage3";
         [TextArea(2, 4)] public string actionJson = "";
         [TextArea(2, 4)] public string stateJson = "";
         public float reward = 0f;
@@ -67,6 +68,7 @@ namespace BalloonSim.Sim
             _w = new StreamWriter(CurrentLogPath);
             _w.WriteLine(Header());
             _w.Flush();
+            BeginEpisode();
 
             Debug.Log($"[DataLogger] Logging to: {CurrentLogPath}");
         }
@@ -85,6 +87,11 @@ namespace BalloonSim.Sim
         public void PauseLogging(bool pause)
         {
             paused = pause;
+        }
+
+        public void ResumeLogging()
+        {
+            paused = false;
         }
 
         public void OpenLogFolder()
@@ -119,7 +126,9 @@ namespace BalloonSim.Sim
                 try { File.Delete(f); } catch { }
             }
 
-            episodeId = 0;
+            episodeId = -1;
+            _currentEpisodeId = -1;
+            frameIndex = 0;
             Debug.Log($"[DataLogger] Cleared {files.Length} log files.");
             StartLogging();
         }
@@ -128,34 +137,37 @@ namespace BalloonSim.Sim
         {
             if (!enabledLogging || paused || _w == null || config == null || balloon == null) return;
 
-            if (episodeId < 0) episodeId = 0;
+            if (_currentEpisodeId < 0)
+                BeginEpisode();
+            if (enableStage3Columns && mode != "stage3" && mode != "manual" && mode != "baseline" && mode != "exploration" && mode != "policy")
+                mode = "stage3";
 
             float t = Time.time;
             Vector3 pos = balloon.transform.position;
             Vector3 vel = balloon.velocity;
-            Vector3 p = autopilot != null ? autopilot.Predicted : Vector3.zero;
-            float predSigma = autopilot != null ? autopilot.PredSigma : 1f;
             Vector3 waypointPos = waypoint != null ? waypoint.position : Vector3.zero;
             float[,] g = field != null ? field.SampleGradient(pos) : new float[3, 3];
             int histCount = observationBuffer != null ? observationBuffer.Count : 0;
 
             if (enableStage3Columns)
             {
-                stateJson = BuildStage3StateJson(pos, vel, p, predSigma, waypointPos, g, histCount);
-                actionJson = BuildStage3ActionJson(game != null ? game.UserTargetVel : Vector3.zero);
+                stateJson = BuildStage3StateJson(pos, vel, waypointPos, g, histCount);
+                Vector3 actionLabel = game != null ? game.LastDesiredVel : Vector3.zero;
+                actionJson = BuildStage3ActionJson(actionLabel);
                 reward = ComputeStage3Reward(pos, vel, waypointPos, field != null ? field.Sample(pos) : Vector3.zero);
             }
 
             string line = string.Join(",",
                 F(t),
-                enableStage3Columns ? episodeId.ToString(CultureInfo.InvariantCulture) : "",
+                enableStage3Columns ? _currentEpisodeId.ToString(CultureInfo.InvariantCulture) : "",
+                enableStage3Columns ? frameIndex.ToString(CultureInfo.InvariantCulture) : "",
                 enableStage3Columns ? CsvEscape(runId) : "",
                 enableStage3Columns ? CsvEscape(mode) : "",
                 enableStage3Columns ? CsvEscape(actionJson) : "",
                 enableStage3Columns ? CsvEscape(stateJson) : "",
                 enableStage3Columns ? F(reward) : ""
             );
-            episodeId++;
+            frameIndex++;
 
             _w.WriteLine(line);
             _n++;
@@ -168,6 +180,7 @@ namespace BalloonSim.Sim
             return string.Join(",",
                 "t",
                 "episode_id",
+                "frame_index",
                 "run_id",
                 "mode",
                 "action_json",
@@ -176,20 +189,19 @@ namespace BalloonSim.Sim
             );
         }
 
-        private string BuildStage3StateJson(Vector3 pos, Vector3 vel, Vector3 pred, float sigma, Vector3 waypointPos, float[,] g, int histCount)
+        private string BuildStage3StateJson(Vector3 pos, Vector3 vel, Vector3 waypointPos, float[,] g, int histCount)
         {
-            var wpDir = NormalizeOrZero(waypointPos - pos);
+            Vector3 wind = field != null ? field.Sample(pos) : Vector3.zero;
+            Vector3 wpDir = NormalizeOrZero(waypointPos - pos);
             var sb = new System.Text.StringBuilder(512);
             sb.Append('{');
-            sb.Append("\"pos\":"); AppendJsonVec(sb, pos); sb.Append(',');
             sb.Append("\"vel\":"); AppendJsonVec(sb, vel); sb.Append(',');
-            sb.Append("\"pred\":"); AppendJsonVec(sb, pred); sb.Append(',');
-            sb.Append("\"sigma\":").Append(F(sigma)).Append(',');
+            sb.Append("\"wind\":"); AppendJsonVec(sb, wind); sb.Append(',');
             sb.Append("\"alt_err\":").Append(F(waypointPos.y - pos.y)).Append(',');
             sb.Append("\"waypoint_dir\":"); AppendJsonVec(sb, wpDir); sb.Append(',');
             sb.Append("\"waypoint_dist\":").Append(F(Vector3.Distance(waypointPos, pos))).Append(',');
+            sb.Append("\"prev_action\":"); AppendJsonVec(sb, game != null ? game.LastDesiredVel : Vector3.zero); sb.Append(',');
             sb.Append("\"grad\":"); AppendJsonArray(sb, new[] { g[0,0], g[0,1], g[0,2], g[1,0], g[1,1], g[1,2], g[2,0], g[2,1], g[2,2] }); sb.Append(',');
-            sb.Append("\"env\":"); AppendJsonArray(sb, new[] { config.beaufort, config.gustStrength, config.viscosity, config.densityRatio }); sb.Append(',');
             sb.Append("\"hist_count\":").Append(histCount);
             sb.Append('}');
             return sb.ToString();
@@ -238,6 +250,18 @@ namespace BalloonSim.Sim
             float windAssist = Vector3.Dot(wind, NormalizeOrZero(waypointPos - pos));
             float windReward = 0.02f * Mathf.Max(0f, windAssist);
             return approach + reach + energy + windReward;
+        }
+
+        public void BeginEpisode()
+        {
+            _currentEpisodeId = Mathf.Max(0, episodeId + 1);
+            episodeId = _currentEpisodeId;
+            frameIndex = 0;
+        }
+
+        public void SetStage3Mode(string newMode)
+        {
+            mode = string.IsNullOrWhiteSpace(newMode) ? "stage3" : newMode;
         }
 
         private void DetectNextEpisodeId()

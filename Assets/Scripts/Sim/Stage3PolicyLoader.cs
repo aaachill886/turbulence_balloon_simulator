@@ -28,7 +28,7 @@ namespace BalloonSim.Sim
 
         [Header("I/O")]
         public string inputName = "state_vector";
-        public string actionOutputName = "action_logits";
+        public string actionOutputName = "action";
 
         public bool IsReady { get; private set; }
         public string LastStatus { get; private set; } = "init";

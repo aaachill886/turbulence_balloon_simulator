@@ -14,6 +14,7 @@ namespace BalloonSim.Sim
         public GameController game;
         public TurbulenceField field;
         public TrainingDataLogger trainingLogger;
+        public DataLogger stage3Logger;
 
         [Header("Exploration")]
         [Tooltip("是否启用自动探索")]
@@ -104,6 +105,30 @@ namespace BalloonSim.Sim
             }
         }
 
+        public void RequestStage3Capture(DataLogger logger)
+        {
+            stage3Logger = logger;
+            explorationEnabled = true;
+            _captureSessionRequested = true;
+            _stage2CapturePending = false;
+            _episodeTransitionPending = false;
+            _episodeTransitionTimer = 0f;
+            _episodeTimer = 0f;
+            _phaseTimer = 0f;
+            _releaseHoldPhase = false;
+            if (stage3Logger != null)
+            {
+                stage3Logger.enabledLogging = true;
+                stage3Logger.SetStage3Mode("exploration");
+                stage3Logger.StartLogging();
+                stage3Logger.PauseLogging(false);
+                stage3Logger.BeginEpisode();
+            }
+            if (game != null)
+                game.explorationOverride = true;
+        }
+
+
         public void StopStage2Capture()
         {
             explorationEnabled = false;
@@ -118,6 +143,10 @@ namespace BalloonSim.Sim
                 trainingLogger.SetSamplePhase("transition");
                 trainingLogger.CloseCurrentEpisode();
                 trainingLogger.PauseLogging();
+            }
+            if (stage3Logger != null)
+            {
+                stage3Logger.PauseLogging(true);
             }
         }
 
@@ -142,51 +171,27 @@ namespace BalloonSim.Sim
             var thermo = balloon.GetComponent<BalloonThermodynamics>();
             if (thermo != null && !thermo.IsWarmedUp)
             {
-                _stage2CapturePending = true;
-                if (trainingLogger != null)
-                {
-                    trainingLogger.SetCaptureEnabled(false);
-                    trainingLogger.SetSamplePhase("warmup");
-                    trainingLogger.CloseCurrentEpisode();
-                }
-                return;
+                _stage2CapturePending = false;
             }
 
             float dt = Time.fixedDeltaTime;
+
+            if (game != null)
+                game.SetExplorationTarget(ExplorationTargetVel, _captureSessionRequested && !_episodeTransitionPending && !_stage2CapturePending);
 
             if (_episodeTransitionPending)
             {
                 _episodeTransitionTimer += dt;
                 if (_episodeTransitionTimer < episodeWarmupSeconds)
                 {
-                    if (trainingLogger != null)
-                    {
-                        trainingLogger.SetCaptureEnabled(false);
-                        trainingLogger.SetSamplePhase("transition");
-                    }
+                    if (stage3Logger != null)
+                        stage3Logger.PauseLogging(true);
                     return;
                 }
 
                 _episodeTransitionPending = false;
                 _episodeTransitionTimer = 0f;
                 BeginStableEpisode();
-            }
-            else if (_stage2CapturePending || (trainingLogger != null && !trainingLogger.IsSessionOpen))
-            {
-                if (_episodeTransitionTimer < episodeWarmupSeconds)
-                {
-                    _episodeTransitionTimer += dt;
-                    if (trainingLogger != null)
-                    {
-                        trainingLogger.SetCaptureEnabled(false);
-                        trainingLogger.SetSamplePhase("warmup");
-                    }
-                    return;
-                }
-
-                BeginStableEpisode();
-                _stage2CapturePending = false;
-                _episodeTransitionTimer = 0f;
             }
 
             _episodeTimer += dt;
@@ -243,11 +248,13 @@ namespace BalloonSim.Sim
             }
 
             Vector3 dir = dist > 0.01f ? toTarget / dist : Vector3.zero;
-            float speed = config.throttle * config.throttle * config.manualSpeedScale * speedScale;
+            float speed = Mathf.Max(0.5f, config.throttle * config.throttle * config.manualSpeedScale * speedScale);
             float approach = Mathf.Clamp01(dist / 4f);
             ExplorationTargetVel = _releaseHoldPhase ? Vector3.zero : (dir * speed * approach) + _perturb;
-            if (trainingLogger != null)
-                trainingLogger.SetSamplePhase(_releaseHoldPhase ? "transition" : "stable");
+            if (game != null)
+                game.SetExplorationTarget(ExplorationTargetVel, !_releaseHoldPhase);
+            if (stage3Logger != null)
+                stage3Logger.PauseLogging(false);
         }
 
         private void PickNewTarget()
@@ -318,6 +325,17 @@ namespace BalloonSim.Sim
 
         private void BeginStableEpisode()
         {
+            if (_captureSessionRequested && stage3Logger != null)
+            {
+                stage3Logger.BeginEpisode();
+                stage3Logger.SetStage3Mode(stage2CoverageMode ? "exploration" : "policy");
+            }
+
+            if (stage3Logger != null && stage3Logger.enabledLogging)
+            {
+                stage3Logger.SetStage3Mode(stage2CoverageMode ? "exploration" : "policy");
+            }
+
             if (trainingLogger == null || !_captureSessionRequested) return;
             trainingLogger.ResumeLogging();
             trainingLogger.SetSamplePhase("stable");
@@ -335,6 +353,8 @@ namespace BalloonSim.Sim
                 trainingLogger.SetSamplePhase("transition");
             if (trainingLogger != null)
                 trainingLogger.FlushEpisode();
+            if (stage3Logger != null)
+                stage3Logger.PauseLogging(true);
         }
 
         private void ApplyCoverageRegime()

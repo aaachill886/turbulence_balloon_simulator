@@ -49,7 +49,7 @@ namespace BalloonSim.Sim
 
         public Vector3 Predict()
         {
-            if (onnxPredictor != null && observationBuffer != null && config.enableAIPredictor)
+            if (onnxPredictor != null && observationBuffer != null && config != null && config.enableAIPredictor && (config.controlMode == ControlMode.AssistPredictor || config.controlMode == ControlMode.Stage3Policy))
             {
                 var histFrames = observationBuffer.Snapshot();
                 if (onnxPredictor.TryPredict(histFrames, out var mu, out var sigma))
@@ -126,9 +126,36 @@ namespace BalloonSim.Sim
             float fl = 0.95f;
             Vector3 envMeasured = new Vector3(u.x * fl, u.y * fl + buoy, u.z * fl);
             Vector3 baseVel = userTargetVel;
+            bool isTrueManual = config != null && config.controlMode == ControlMode.TrueManual;
+            bool useHold = config != null && (config.controlMode == ControlMode.BaselineHold || config.controlMode == ControlMode.AssistPredictor || config.controlMode == ControlMode.Stage3Policy);
+            bool usePredictor = config != null && (config.controlMode == ControlMode.AssistPredictor || config.controlMode == ControlMode.Stage3Policy) && config.enableAIPredictor;
+            if (!usePredictor && config != null && config.controlMode == ControlMode.Stage3Policy)
+            {
+                usePredictor = true;
+            }
 
             if (!userActive)
             {
+                if (isTrueManual)
+                {
+                    PushHistory(u);
+                    ThrottleNeed = 0f;
+                    PredErr = 0f;
+                    PredMSE = (p - u).sqrMagnitude / 3f;
+                    LastCommandVel = envMeasured;
+                    return envMeasured;
+                }
+
+                if (!useHold)
+                {
+                    PushHistory(u);
+                    ThrottleNeed = 0f;
+                    PredErr = 0f;
+                    PredMSE = (p - u).sqrMagnitude / 3f;
+                    LastCommandVel = envMeasured;
+                    return envMeasured;
+                }
+
                 Vector3 toSafe = _holdAnchor - balloon.transform.position;
 
                 _holdIy = Mathf.Clamp(_holdIy + toSafe.y * dt, -6f, 6f);
@@ -150,7 +177,7 @@ namespace BalloonSim.Sim
 
                 holdVel = Vector3.ClampMagnitude(holdVel, config.holdMaxSpeed);
 
-                if (!config.aiEnabled)
+                if (config.controlMode == ControlMode.BaselineHold)
                 {
                     ThrottleNeed = holdVel.magnitude;
                     PredErr = 0f;
@@ -171,14 +198,17 @@ namespace BalloonSim.Sim
                 }
 
                 Vector3 assistHold = holdVel;
-                if (config.holdEnvComp > 0f)
+                if (config.controlMode == ControlMode.AssistPredictor || config.controlMode == ControlMode.Stage3Policy)
                 {
-                    Vector3 envEstimated = new Vector3(p.x * fl, p.y * fl + buoy, p.z * fl);
-                    Vector3 envForComp = config.assistUseOracleEnvCancellation ? envMeasured : envEstimated;
-                    float compGain = Mathf.Clamp01(config.holdEnvComp);
-                    if (!config.assistUseOracleEnvCancellation && config.usePredSigmaConfidence)
-                        compGain *= Mathf.Lerp(1f, 0.35f, Mathf.Clamp01(PredSigma / 2.0f));
-                    assistHold -= envForComp * compGain;
+                    if (config.holdEnvComp > 0f)
+                    {
+                        Vector3 envEstimated = new Vector3(p.x * fl, p.y * fl + buoy, p.z * fl);
+                        Vector3 envForComp = config.assistUseOracleEnvCancellation ? envMeasured : envEstimated;
+                        float compGain = Mathf.Clamp01(config.holdEnvComp);
+                        if (!config.assistUseOracleEnvCancellation && config.usePredSigmaConfidence)
+                            compGain *= Mathf.Lerp(1f, 0.35f, Mathf.Clamp01(PredSigma / 2.0f));
+                        assistHold -= envForComp * compGain;
+                    }
                 }
                 assistHold = Vector3.ClampMagnitude(assistHold, config.holdMaxSpeed);
 
@@ -190,7 +220,17 @@ namespace BalloonSim.Sim
                 return assistHold;
             }
 
-            if (!config.aiEnabled)
+            if (isTrueManual)
+            {
+                PushHistory(u);
+                ThrottleNeed = 0f;
+                PredErr = 0f;
+                PredMSE = (p - u).sqrMagnitude / 3f;
+                LastCommandVel = baseVel;
+                return baseVel;
+            }
+
+            if (!useHold)
             {
                 PushHistory(u);
                 ThrottleNeed = 0f;

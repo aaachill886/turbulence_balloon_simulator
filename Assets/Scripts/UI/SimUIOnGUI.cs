@@ -12,6 +12,9 @@ namespace BalloonSim.UI
         public BalloonState balloon;
         public DataLogger logger;
         public BenchmarkRunner benchmarkRunner;
+        public RandomExplorationAgent explorer;
+        public TrainingDataLogger trainingLogger;
+        public Stage3PolicyRunner policyRunner;
 
         private bool _showBasic = true;
         private bool _showAdv;
@@ -27,6 +30,12 @@ namespace BalloonSim.UI
                 logger = FindObjectOfType<DataLogger>();
             if (benchmarkRunner == null)
                 benchmarkRunner = FindObjectOfType<BenchmarkRunner>();
+            if (explorer == null)
+                explorer = FindObjectOfType<RandomExplorationAgent>();
+            if (trainingLogger == null)
+                trainingLogger = FindObjectOfType<TrainingDataLogger>();
+            if (policyRunner == null)
+                policyRunner = FindObjectOfType<Stage3PolicyRunner>();
 
             if (benchmarkRunner == null)
             {
@@ -64,28 +73,28 @@ namespace BalloonSim.UI
 
             GUILayout.BeginArea(new Rect(10, 10, 980, 390), GUI.skin.box);
             _topScroll = GUILayout.BeginScrollView(_topScroll, GUILayout.Width(960), GUILayout.Height(370));
-            string modeLabel = config.aiEnabled ? (config.enableAIPredictor ? "control-assist+predictor" : "control-assist") : "manual-true-flow";
+            string modeLabel = config.controlMode switch
+            {
+                ControlMode.TrueManual => "manual-true-flow",
+                ControlMode.BaselineHold => "baseline-hold",
+                ControlMode.AssistPredictor => "assist+predictor",
+                ControlMode.Stage3Policy => "stage3-policy",
+                _ => "unknown",
+            };
             GUILayout.Label($"mode: {modeLabel}");
+            GUILayout.Label($"controlMode: {config.controlMode}");
             GUILayout.Label($"pos: {balloon.transform.position.x:F1}, {balloon.transform.position.y:F1}, {balloon.transform.position.z:F1}");
             GUILayout.Label($"vel: {balloon.velocity.x:F1}, {balloon.velocity.y:F1}, {balloon.velocity.z:F1}");
             GUILayout.Label($"yaw:{balloon.yawDeg:F1}°  fwd:{balloon.forward.x:F2},{balloon.forward.z:F2}");
 
             Vector3 u = field != null ? field.Sample(balloon.transform.position) : Vector3.zero;
             float turb = u.magnitude;
-            bool assistOn = config.aiEnabled;
-            bool predictorOn = config.enableAIPredictor;
+            bool assistOn = config.controlMode != ControlMode.TrueManual;
             string pred = autopilot != null && assistOn ? autopilot.PredErr.ToString("F2") : "-";
             string pmse = autopilot != null && assistOn ? autopilot.PredMSE.ToString("F4") : "-";
             string sig = autopilot != null && assistOn ? autopilot.PredSigma.ToString("F2") : "-";
             string thr = autopilot != null && assistOn ? autopilot.ThrottleNeed.ToString("F2") : "-";
-            string model = (autopilot != null && autopilot.onnxPredictor != null) ? autopilot.onnxPredictor.RuntimeMode : "n/a";
-            string ms = (autopilot != null && autopilot.onnxPredictor != null && model == "onnx") ? autopilot.onnxPredictor.LastInferenceMs.ToString("F2") : "-";
-            string status = (autopilot != null && autopilot.onnxPredictor != null) ? autopilot.onnxPredictor.LastStatusMessage : "-";
-            string modelSrc = (autopilot != null && autopilot.onnxPredictor != null) ? autopilot.onnxPredictor.LastModelSource : "n/a";
-            string normSrc = (autopilot != null && autopilot.onnxPredictor != null) ? autopilot.onnxPredictor.LastNormSource : "n/a";
-            Vector3 onnxMu = (autopilot != null && autopilot.onnxPredictor != null) ? autopilot.onnxPredictor.LastMu : Vector3.zero;
-            float onnxAbsErr = (autopilot != null && autopilot.onnxPredictor != null) ? Vector3.Distance(u, onnxMu) : 0f;
-            string stage2Line = $"Stage2 baseline hold: {((assistOn && !predictorOn) ? "on" : (assistOn ? "on+predictor" : "off"))} | predictor mode={model} status={status} ms={ms} modelSrc={modelSrc} normSrc={normSrc}";
+            string stage2Line = $"Controller: mode={(config.controlMode == ControlMode.TrueManual ? "manual" : "assist")} | hold={(assistOn ? "on" : "off")} | wind_sample={u.x:F2},{u.y:F2},{u.z:F2}";
             string stage3Mode = logger != null ? (logger.enabledLogging ? (logger.paused ? "paused" : "recording") : "off") : "n/a";
             string stage3Line = $"Stage3 policy log: {stage3Mode} dir={logger?.LogDirectory ?? "n/a"} episode={logger?.episodeId.ToString() ?? "n/a"} run={logger?.runId ?? "n/a"} mode={logger?.mode ?? "n/a"}";
             var policyRunner = FindObjectOfType<Stage3PolicyRunner>();
@@ -98,9 +107,14 @@ namespace BalloonSim.UI
             GUILayout.Label(stage3Line);
             GUILayout.Label(stage3PolicyLine);
             GUILayout.Label($"turb:{turb:F2}  Bft:{config.beaufort:F1}  rhoB/rhoA:{config.densityRatio:F2}  pred:{pred} mse:{pmse} sigma:{sig} throttle:{thr}");
-            GUILayout.Label($"obs_u: {u.x:F3},{u.y:F3},{u.z:F3} | onnx_mu: {onnxMu.x:F3},{onnxMu.y:F3},{onnxMu.z:F3} | |err|:{onnxAbsErr:F4}");
-            GUILayout.Label($"onnx-status: {status}");
-            string holdMode = config.aiEnabled ? (config.strictHoldNoDrift ? "baseline-hold" : "assist-hold") : "manual";
+            string holdMode = config.controlMode switch
+            {
+                ControlMode.TrueManual => "manual",
+                ControlMode.BaselineHold => "baseline-hold",
+                ControlMode.AssistPredictor => "assist-hold",
+                ControlMode.Stage3Policy => "stage3-policy",
+                _ => "unknown",
+            };
             string oracle = config.assistUseOracleEnvCancellation ? "on" : "off";
             GUILayout.Label($"holdMode: {holdMode}  oracleEnv: {oracle}");
             GUILayout.Label($"fog:{(config.showVolumetricFog ? "on" : "off")} heat:{(config.showHeatmapPoints ? "on" : "off")} minimap:{(config.showMinimap ? "on" : "off")}");
@@ -108,94 +122,55 @@ namespace BalloonSim.UI
             string hint = GetBestKeyHint();
             GUILayout.Label($"suggested low-resistance keys: {hint}");
 
-            var explorer = FindObjectOfType<RandomExplorationAgent>();
-            var trainLog = FindObjectOfType<TrainingDataLogger>();
+            var explorer = this.explorer;
+            var trainLog = this.trainingLogger;
 
             GUILayout.BeginHorizontal();
             if (GUILayout.Button("Reset (R)", GUILayout.Height(24))) game?.ResetAll();
-            if (GUILayout.Button("Manual", GUILayout.Height(24))) config.aiEnabled = false;
-            if (GUILayout.Button("Control Assist", GUILayout.Height(24))) config.aiEnabled = true;
-            if (GUILayout.Button(config.enableAIPredictor ? "Stage2 Predictor: ON" : "Stage2 Predictor: OFF", GUILayout.Height(24))) config.enableAIPredictor = !config.enableAIPredictor;
+            if (GUILayout.Button("Manual", GUILayout.Height(24))) config.controlMode = ControlMode.TrueManual;
+            if (GUILayout.Button("Control Assist", GUILayout.Height(24))) config.controlMode = ControlMode.BaselineHold;
             GUILayout.EndHorizontal();
+            GUILayout.Space(6);
 
-            var thermo = balloon != null ? balloon.GetComponent<BalloonThermodynamics>() : null;
-            if (explorer != null && trainLog != null)
-            {
-                GUILayout.Space(4);
-                GUILayout.BeginVertical(GUI.skin.box);
-                GUILayout.Label("Stage2 Capture Mode — strong mixed disturbance, auto exploration, writes training_data, no hover target");
-                GUILayout.BeginHorizontal();
-                if (GUILayout.Button(explorer.explorationEnabled ? "Stop Stage2 Capture" : "Start Stage2 Capture", GUILayout.Height(30)))
-                {
-                    if (!explorer.CaptureSessionRequested)
-                        ApplyStage2CaptureMode(explorer, trainLog);
-                    else
-                        explorer.StopStage2Capture();
-                }
-                if (GUILayout.Button(trainLog.IsPaused ? "Resume Capture" : "Pause Capture", GUILayout.Height(30)))
-                {
-                    if (trainLog.IsPaused)
-                        explorer.RequestStage2Capture(trainLog);
-                    else
-                        explorer.StopStage2Capture();
-                }
-                if (GUILayout.Button(_confirmClearStage2 ? "Confirm Clear" : "Clear training_data", GUILayout.Height(30)))
-                {
-                    if (!_confirmClearStage2) _confirmClearStage2 = true;
-                    else
-                    {
-                        explorer.StopStage2Capture();
-                        trainLog.logMode = TrainingDataLogger.LogMode.TrainingData;
-                        trainLog.SetCaptureEnabled(false);
-                        trainLog.ClearAllTrainingData();
-                        _confirmClearStage2 = false;
-                    }
-                }
-                if (GUILayout.Button("Cancel", GUILayout.Height(30))) _confirmClearStage2 = false;
-                if (GUILayout.Button("Open training_data", GUILayout.Height(30))) OpenTrainingFolder(trainLog);
-                GUILayout.EndHorizontal();
-                GUILayout.Label($"Stage2 wind dataset → training_data | episode: {trainLog.EpisodeIndex} | frames: {trainLog.TotalFramesLogged} | {(trainLog.IsPaused ? "paused" : "recording")} | exploration={(explorer.explorationEnabled ? "on" : "off")} | pending={(explorer.Stage2CapturePending ? "yes" : "no")} | warmup={(thermo != null ? (thermo.IsWarmedUp ? "done" : "warming") : "n/a")}");
-                GUILayout.EndVertical();
-            }
-
-            GUILayout.Space(4);
+            GUILayout.Space(6);
             GUILayout.BeginVertical(GUI.skin.box);
-            GUILayout.Label("Flight Control Test Mode — strong disturbance + higher control authority, Stage2 predictor enabled, optional Stage3 policy");
+            GUILayout.Label("Stage3 Training");
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Apply Flight Test Mode", GUILayout.Height(30)))
-                ApplyFlightControlTestMode(explorer, trainLog, policyRunner);
-            if (GUILayout.Button(policyRunner != null && policyRunner.enablePolicy ? "Stage3 Policy: ON" : "Stage3 Policy: OFF", GUILayout.Height(30)) && policyRunner != null)
-            {
-                policyRunner.enablePolicy = !policyRunner.enablePolicy;
-                policyRunner.Reinitialize();
-            }
-            if (GUILayout.Button("Stop Capture/Exploration", GUILayout.Height(30)))
+            if (GUILayout.Button("Start Stage3 Training", GUILayout.Height(28)) && explorer != null && logger != null)
+                ApplyStage3CaptureMode(explorer, logger);
+            if (GUILayout.Button("Pause Training Log", GUILayout.Height(28)) && logger != null)
+                logger.PauseLogging(true);
+            if (GUILayout.Button("Resume Training Log", GUILayout.Height(28)) && logger != null)
+                logger.PauseLogging(false);
+            if (GUILayout.Button("Clear Training Log", GUILayout.Height(28)) && logger != null)
             {
                 if (explorer != null) explorer.StopStage2Capture();
-                if (trainLog != null) trainLog.PauseLogging();
+                logger.ClearAllLogs();
             }
-            if (GUILayout.Button("Start Stage3 Policy Log", GUILayout.Height(30)) && logger != null)
-                StartOrResumeStage3Log(explorer);
+            if (GUILayout.Button("Open Training Log", GUILayout.Height(28)) && logger != null)
+                logger.OpenLogFolder();
             GUILayout.EndHorizontal();
-            GUILayout.Label($"Flight test: authority throttle={config.throttle:F2} controlRate={config.manualSpeedScale:F2} | Stage2 predictor={(config.enableAIPredictor ? "on" : "off")} | Stage3 policy={(policyRunner != null && policyRunner.enablePolicy ? "on" : "off")}");
             GUILayout.EndVertical();
 
-            if (logger != null)
+            GUILayout.BeginVertical(GUI.skin.box);
+            GUILayout.Label("Stage3 Application");
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Apply Stage3 Policy Mode", GUILayout.Height(28)))
+                ApplyStage3PolicyMode(explorer, logger, this.policyRunner);
+            if (GUILayout.Button(this.policyRunner != null && this.policyRunner.enablePolicy ? "Policy: ON" : "Policy: OFF", GUILayout.Height(28)) && this.policyRunner != null)
             {
-                GUILayout.BeginHorizontal();
-                if (GUILayout.Button(logger.enabledLogging ? (logger.paused ? "Resume Stage3" : "Pause Stage3") : "Start Stage3 Log", GUILayout.Height(24)))
-                {
-                    if (!logger.enabledLogging)
-                        StartOrResumeStage3Log(explorer);
-                    else
-                        logger.PauseLogging(!logger.paused);
-                }
-                if (GUILayout.Button("Open Log Folder", GUILayout.Height(24))) logger.OpenLogFolder();
-                if (GUILayout.Button("Clear Logs", GUILayout.Height(24))) logger.ClearAllLogs();
-                string logState = !logger.enabledLogging ? "off" : (logger.paused ? "paused" : "recording");
-                GUILayout.Label($"Log: {logState}");
-                GUILayout.EndHorizontal();
+                this.policyRunner.enablePolicy = !this.policyRunner.enablePolicy;
+                this.policyRunner.Reinitialize();
             }
+            if (GUILayout.Button("Stop Policy", GUILayout.Height(28)))
+            {
+                if (explorer != null) explorer.StopStage2Capture();
+                if (logger != null) logger.PauseLogging(true);
+            }
+            if (GUILayout.Button("Start Policy Log", GUILayout.Height(28)) && logger != null)
+                StartOrResumeStage3Log(explorer);
+            GUILayout.EndHorizontal();
+            GUILayout.EndVertical();
 
             GUILayout.EndScrollView();
             GUILayout.EndArea();
@@ -312,22 +287,32 @@ namespace BalloonSim.UI
             field?.Generate();
         }
 
-        private void ApplyStage2CaptureMode(RandomExplorationAgent explorer, TrainingDataLogger trainLog)
+        private void ApplyStage3CaptureMode(RandomExplorationAgent explorer, DataLogger stage3Log)
         {
             ApplyStrongMixedDisturbance();
-            config.aiEnabled = false;
+            config.controlMode = ControlMode.TrueManual;
             config.enableAIPredictor = false;
             config.throttle = 1.0f;
             config.manualSpeedScale = 0.22f;
 
-            explorer.includeReleaseHoldCycles = true;
-            explorer.RequestStage2Capture(trainLog);
+            if (explorer != null)
+            {
+                explorer.includeReleaseHoldCycles = true;
+                explorer.RequestStage3Capture(stage3Log);
+            }
+            if (stage3Log != null)
+            {
+                stage3Log.enabledLogging = true;
+                stage3Log.PauseLogging(false);
+                stage3Log.SetStage3Mode("exploration");
+                if (!stage3Log.IsInvoking()) { }
+            }
         }
 
-        private void ApplyFlightControlTestMode(RandomExplorationAgent explorer, TrainingDataLogger trainLog, Stage3PolicyRunner policyRunner)
+        private void ApplyStage3PolicyMode(RandomExplorationAgent explorer, DataLogger stage3Log, Stage3PolicyRunner policyRunner)
         {
             ApplyStrongMixedDisturbance();
-            config.aiEnabled = true;
+            config.controlMode = ControlMode.Stage3Policy;
             config.enableAIPredictor = true;
             config.throttle = 4.0f;
             config.manualSpeedScale = 1.2f;
@@ -341,25 +326,25 @@ namespace BalloonSim.UI
             if (explorer != null)
             {
                 explorer.StopStage2Capture();
-                explorer.trainingLogger = trainLog;
+                explorer.stage3Logger = stage3Log;
             }
-            if (trainLog != null)
+            if (stage3Log != null)
             {
-                trainLog.SetCaptureEnabled(false);
-                trainLog.PauseLogging();
+                stage3Log.enabledLogging = true;
+                stage3Log.PauseLogging(false);
             }
             if (logger != null) logger.PauseLogging(true);
             ConfigureThermodynamicsForNeutralFlight();
             game?.ResetAll();
             ApplyStrongMixedDisturbance();
-            config.aiEnabled = true;
-            config.enableAIPredictor = true;
+            config.controlMode = ControlMode.Stage3Policy;
+            config.enableAIPredictor = false;
             config.throttle = 4.0f;
             config.manualSpeedScale = 1.2f;
             config.densityRatio = 1.0f;
             if (policyRunner != null)
             {
-                policyRunner.enablePolicy = false;
+                policyRunner.enablePolicy = true;
                 policyRunner.Reinitialize();
             }
         }
@@ -390,11 +375,10 @@ namespace BalloonSim.UI
         {
             if (logger == null) return;
             if (explorer != null) explorer.StopStage2Capture();
-            config.aiEnabled = true;
-            config.enableAIPredictor = true;
-            logger.mode = "stage3_with_stage2_predictor";
+            config.controlMode = ControlMode.Stage3Policy;
+            config.enableAIPredictor = false;
+            logger.SetStage3Mode("policy");
             logger.runId = string.IsNullOrWhiteSpace(logger.runId) ? System.DateTime.Now.ToString("yyyyMMdd_HHmmss") : logger.runId;
-            logger.episodeId = logger.episodeId < 0 ? 0 : logger.episodeId;
             if (!logger.enabledLogging)
             {
                 logger.enabledLogging = true;

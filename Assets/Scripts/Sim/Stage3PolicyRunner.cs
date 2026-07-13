@@ -21,7 +21,7 @@ namespace BalloonSim.Sim
         public string normFileName = "policy_norm.json";
         public string metaFileName = "policy_meta.json";
         public string stateInputName = "state_vector";
-        public string actionOutputName = "action_logits";
+        public string actionOutputName = "action";
 
         [Header("Refs")]
         public SimulationConfig config;
@@ -81,7 +81,7 @@ namespace BalloonSim.Sim
             if (!ShouldRunPolicy())
             {
                 RuntimeMode = "off";
-                LastStatusMessage = config != null && !config.aiEnabled ? "Stage3 policy waiting for AI mode" : "Stage3 policy disabled";
+                LastStatusMessage = config != null && config.controlMode != ControlMode.Stage3Policy ? "Stage3 policy waiting for Stage3Policy mode" : "Stage3 policy disabled";
                 return false;
             }
 
@@ -145,7 +145,7 @@ namespace BalloonSim.Sim
 
         private bool ShouldRunPolicy()
         {
-            return enablePolicy && config != null && config.aiEnabled;
+            return enablePolicy && config != null && config.controlMode == ControlMode.Stage3Policy;
         }
 
         private bool BuildStateVector(out float[] state)

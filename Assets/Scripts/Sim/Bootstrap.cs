@@ -15,7 +15,8 @@ namespace BalloonSim.Sim
             Application.runInBackground = true;
 
             var cfg = ScriptableObject.CreateInstance<SimulationConfig>();
-            cfg.aiEnabled = true; // default to control-assist mode
+            cfg.controlMode = ControlMode.BaselineHold; // default to control-assist mode
+            cfg.aiEnabled = true; // legacy compatibility only
             // Default mixed-condition scene for Stage2 data collection
             cfg.beaufort = 9.5f;
             cfg.gustStrength = 10.5f;
@@ -214,7 +215,13 @@ namespace BalloonSim.Sim
             explorer.game = game;
             explorer.field = field;
             explorer.trainingLogger = trainLog;
+            explorer.stage3Logger = log;
             explorer.explorationEnabled = false;
+
+            ui.explorer = explorer;
+            ui.trainingLogger = trainLog;
+            ui.policyRunner = policy;
+            ui.logger = log;
         }
     }
 }

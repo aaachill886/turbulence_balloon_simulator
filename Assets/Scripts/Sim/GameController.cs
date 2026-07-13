@@ -24,6 +24,7 @@ namespace BalloonSim.Sim
 
         public Vector3 UserTargetVel { get; private set; }
         public bool UserActive { get; private set; }
+        public bool explorationOverride = false;
         public Vector3 LastDesiredVel { get; private set; }
         public Vector3 LastAcceleration { get; private set; }
 
@@ -79,6 +80,21 @@ namespace BalloonSim.Sim
         public void ToggleAI(bool enabled) => config.aiEnabled = enabled;
         public void ToggleTornado() => config.tornado = !config.tornado;
 
+        public void SetUserTarget(Vector3 targetVel, bool active = true)
+        {
+            UserTargetVel = targetVel;
+            UserActive = active;
+            LastDesiredVel = targetVel;
+        }
+
+        public void SetExplorationTarget(Vector3 targetVel, bool active = true)
+        {
+            if (!explorationOverride) return;
+            UserTargetVel = targetVel;
+            UserActive = active;
+            LastDesiredVel = targetVel;
+        }
+
         private void Update()
         {
             ReadInput();
@@ -100,9 +116,9 @@ namespace BalloonSim.Sim
 
             Vector3 envMeasured = field != null ? field.Sample(balloon.transform.position) : Vector3.zero;
             Vector3 desiredVel;
-            if (config != null && !config.aiEnabled)
+            bool isTrueManual = config != null && config.controlMode == ControlMode.TrueManual;
+            if (isTrueManual)
             {
-                // True manual: direct stick input + real flow influence, no auto-hold.
                 desiredVel = UserTargetVel + envMeasured;
             }
             else
@@ -185,13 +201,12 @@ namespace BalloonSim.Sim
             var explorer = FindObjectOfType<RandomExplorationAgent>();
             if (explorer != null && explorer.IsExploring)
             {
-                UserTargetVel = explorer.ExplorationTargetVel;
-                UserActive = true;
+                SetUserTarget(explorer.ExplorationTargetVel, true);
                 return;
             }
 
             // Stage3 policy only assists active player movement. With no WASD/J/K input,
-            // keep UserActive=false so Stage2/Control Assist can hold the last safe pose.
+            // keep UserActive=false so Control Assist can hold the last safe pose.
         }
 
         private void UpdateAttitude(float dt, Vector3 desiredVel)

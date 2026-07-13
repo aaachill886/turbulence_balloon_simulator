@@ -2,6 +2,14 @@ using UnityEngine;
 
 namespace BalloonSim.Sim
 {
+    public enum ControlMode
+    {
+        TrueManual,
+        BaselineHold,
+        AssistPredictor,
+        Stage3Policy,
+    }
+
     [CreateAssetMenu(menuName = "BalloonSim/Simulation Config")]
     public class SimulationConfig : ScriptableObject
     {
@@ -17,6 +25,7 @@ namespace BalloonSim.Sim
         [Header("Control")]
         [Min(0f)] public float throttle = 1f;
         [Min(0f)] public float manualSpeedScale = 0.22f;
+        public ControlMode controlMode = ControlMode.BaselineHold;
         public bool enableAIPredictor = false;
 
         [Header("Assist/Hold")]
@@ -48,6 +57,7 @@ namespace BalloonSim.Sim
         [Min(0f)] public float wakeStrength = 1f;
 
         [Header("Autopilot")]
+        [Tooltip("Legacy compatibility flag. Control flow now uses controlMode instead.")]
         public bool aiEnabled = false;
         [Min(0f)] public float aiGain = 0.8f;
         [Min(0f)] public float ecoKeep = 0.35f;
