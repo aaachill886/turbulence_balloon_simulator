@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "model_file": "policy_net.pt",
+  "onnx_file": "policy_net.onnx",
+  "norm_file": "policy_norm.json",
+  "state_dim": 19,
+  "action_dim": 3,
+  "state_columns": [
+    "vel_x",
+    "vel_y",
+    "vel_z",
+    "wind_x",
+    "wind_y",
+    "wind_z",
+    "intent_x",
+    "intent_y",
+    "intent_z",
+    "intent_active",
+    "grad_00",
+    "grad_01",
+    "grad_02",
+    "grad_10",
+    "grad_11",
+    "grad_12",
+    "grad_20",
+    "grad_21",
+    "grad_22"
+  ],
+  "action_columns": [
+    "residual_x",
+    "residual_y",
+    "residual_z"
+  ],
+  "action_semantics": "bounded_residual_v2",
+  "policy_composition": "corrected_target_velocity = player_intent_velocity + predicted_residual",
+  "source_data_dir": "L:\\v3\\AI foundation\\turbulence_balloon_simulator\\stage3 log",
+  "export_format": "pt+onnx+json"
+}
