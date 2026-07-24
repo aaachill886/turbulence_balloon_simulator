@@ -79,6 +79,15 @@ namespace BalloonSim.Sim
         private bool _captureSessionRequested;
         private float _episodeTransitionTimer;
         private System.Random _rng;
+        private Vector3 _simulatedIntent;
+
+        [Header("Stage3 Keyboard Intent Coverage")]
+        public float intentPhaseMinSeconds = 0.2f;
+        public float intentPhaseMaxSeconds = 2.5f;
+        [Range(0f, 1f)] public float idleIntentProbability = 0.25f;
+        [Range(0f, 1f)] public float reverseIntentProbability = 0.15f;
+        public int smallScaleTargetSamples = 50000;
+        public int largeScaleTargetSamples = 200000;
 
         public Vector3 ExplorationTargetVel { get; private set; }
         public bool IsExploring => explorationEnabled;
@@ -116,6 +125,7 @@ namespace BalloonSim.Sim
             _episodeTimer = 0f;
             _phaseTimer = 0f;
             _releaseHoldPhase = false;
+            PickKeyboardIntent();
             if (stage3Logger != null)
             {
                 stage3Logger.enabledLogging = true;
@@ -125,7 +135,10 @@ namespace BalloonSim.Sim
                 stage3Logger.BeginEpisode();
             }
             if (game != null)
+            {
                 game.explorationOverride = true;
+                game.SetExplorationTarget(_simulatedIntent, _simulatedIntent.sqrMagnitude > 1e-6f);
+            }
         }
 
 
@@ -137,6 +150,13 @@ namespace BalloonSim.Sim
             _episodeTransitionPending = false;
             _episodeTransitionTimer = 0f;
             ExplorationTargetVel = Vector3.zero;
+            _simulatedIntent = Vector3.zero;
+            if (game != null)
+            {
+                game.SetExplorationTarget(Vector3.zero, false);
+                game.explorationOverride = false;
+                game.SetUserTarget(Vector3.zero, false);
+            }
             if (trainingLogger != null)
             {
                 trainingLogger.SetCaptureEnabled(false);
@@ -177,7 +197,9 @@ namespace BalloonSim.Sim
             float dt = Time.fixedDeltaTime;
 
             if (game != null)
-                game.SetExplorationTarget(ExplorationTargetVel, _captureSessionRequested && !_episodeTransitionPending && !_stage2CapturePending);
+                game.SetExplorationTarget(
+                    ExplorationTargetVel,
+                    ExplorationTargetVel.sqrMagnitude > 1e-6f && _captureSessionRequested && !_episodeTransitionPending && !_stage2CapturePending);
 
             if (_episodeTransitionPending)
             {
@@ -206,23 +228,10 @@ namespace BalloonSim.Sim
 
             _burstTimer += dt;
             _phaseTimer += dt;
-            if (includeReleaseHoldCycles)
+            if (_phaseTimer >= movePhaseDuration)
             {
-                float phaseLimit = _releaseHoldPhase ? holdPhaseDuration : movePhaseDuration;
-                if (_phaseTimer >= phaseLimit)
-                {
-                    _releaseHoldPhase = !_releaseHoldPhase;
-                    _phaseTimer = 0f;
-                    if (!_releaseHoldPhase)
-                    {
-                        PickNewTarget();
-                        if (trainingLogger != null) trainingLogger.SetSamplePhase("stable");
-                    }
-                    else
-                    {
-                        if (trainingLogger != null) trainingLogger.SetSamplePhase("transition");
-                    }
-                }
+                _phaseTimer = 0f;
+                PickKeyboardIntent();
             }
 
             _perturbTimer += dt;
@@ -237,24 +246,37 @@ namespace BalloonSim.Sim
                 if (trainingLogger != null) trainingLogger.SetSamplePhase(_releaseHoldPhase ? "transition" : "stable");
             }
 
-            Vector3 toTarget = _target - balloon.transform.position;
-            float dist = toTarget.magnitude;
-
-            if (dist < reachRadius)
-            {
-                PickNewTarget();
-                toTarget = _target - balloon.transform.position;
-                dist = toTarget.magnitude;
-            }
-
-            Vector3 dir = dist > 0.01f ? toTarget / dist : Vector3.zero;
             float speed = Mathf.Max(0.5f, config.throttle * config.throttle * config.manualSpeedScale * speedScale);
-            float approach = Mathf.Clamp01(dist / 4f);
-            ExplorationTargetVel = _releaseHoldPhase ? Vector3.zero : (dir * speed * approach) + _perturb;
+            ExplorationTargetVel = _simulatedIntent.sqrMagnitude > 1e-6f
+                ? _simulatedIntent.normalized * speed
+                : Vector3.zero;
             if (game != null)
-                game.SetExplorationTarget(ExplorationTargetVel, !_releaseHoldPhase);
+                game.SetExplorationTarget(ExplorationTargetVel, _simulatedIntent.sqrMagnitude > 1e-6f);
             if (stage3Logger != null)
                 stage3Logger.PauseLogging(false);
+        }
+
+        private void PickKeyboardIntent()
+        {
+            movePhaseDuration = Rf(intentPhaseMinSeconds, intentPhaseMaxSeconds);
+            if (_rng.NextDouble() < idleIntentProbability)
+            {
+                _simulatedIntent = Vector3.zero;
+                return;
+            }
+
+            Vector3[] intents =
+            {
+                Vector3.forward, Vector3.back, Vector3.left, Vector3.right, Vector3.up, Vector3.down,
+                new Vector3(-1f, 0f, 1f), new Vector3(1f, 0f, 1f),
+                new Vector3(-1f, 0f, -1f), new Vector3(1f, 0f, -1f),
+                new Vector3(0f, 1f, 1f), new Vector3(0f, -1f, 1f),
+                new Vector3(1f, 1f, 0f), new Vector3(-1f, -1f, 0f)
+            };
+            Vector3 next = intents[_rng.Next(intents.Length)].normalized;
+            if (_simulatedIntent.sqrMagnitude > 1e-6f && _rng.NextDouble() < reverseIntentProbability)
+                next = -_simulatedIntent.normalized;
+            _simulatedIntent = next;
         }
 
         private void PickNewTarget()

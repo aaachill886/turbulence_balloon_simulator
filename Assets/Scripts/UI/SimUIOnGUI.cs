@@ -150,6 +150,14 @@ namespace BalloonSim.UI
             if (GUILayout.Button("Open Training Log", GUILayout.Height(28)) && logger != null)
                 logger.OpenLogFolder();
             GUILayout.EndHorizontal();
+            if (explorer != null && logger != null)
+            {
+                int targetSamples = logger.WrittenSamples < explorer.smallScaleTargetSamples
+                    ? explorer.smallScaleTargetSamples
+                    : explorer.largeScaleTargetSamples;
+                float progress = targetSamples > 0 ? Mathf.Clamp01((float)logger.WrittenSamples / targetSamples) : 0f;
+                GUILayout.Label($"Intent collection: {logger.WrittenSamples:N0} / {targetSamples:N0} ({progress:P1}) | phase={(logger.WrittenSamples < explorer.smallScaleTargetSamples ? "small-scale validation" : "large-scale")}");
+            }
             GUILayout.EndVertical();
 
             GUILayout.BeginVertical(GUI.skin.box);
@@ -293,7 +301,18 @@ namespace BalloonSim.UI
             config.controlMode = ControlMode.TrueManual;
             config.enableAIPredictor = false;
             config.throttle = 1.0f;
-            config.manualSpeedScale = 0.22f;
+            config.manualSpeedScale = 0.5f;
+            if (game != null)
+            {
+                game.expertVelocityErrorScale = 2.0f;
+                game.expertTrackingResidualMax = 0.12f;
+                game.expertWindScale = 50.0f;
+                game.expertLateralWindResidualMax = 0.16f;
+                game.expertAlongWindResidualMax = 0.06f;
+                game.stage3IntentMaxSpeed = 0.5f;
+                game.stage3ResidualMaxSpeed = 0.25f;
+                game.stage3ResidualBlend = 1.0f;
+            }
 
             if (explorer != null)
             {
@@ -314,14 +333,17 @@ namespace BalloonSim.UI
             ApplyStrongMixedDisturbance();
             config.controlMode = ControlMode.Stage3Policy;
             config.enableAIPredictor = true;
-            config.throttle = 4.0f;
-            config.manualSpeedScale = 1.2f;
+            config.throttle = 1.0f;
+            config.manualSpeedScale = 0.5f;
             config.densityRatio = 1.0f;
-            config.holdPosK = 2.4f;
-            config.holdVelK = 2.2f;
+            config.holdPosK = 2.5f;
+            config.holdVelK = 3.5f;
             config.holdMaxSpeed = 8.0f;
-            config.holdEnvComp = 0.35f;
+            config.holdForwardK = 0f;
+            config.holdReleaseVelK = 0f;
+            config.holdEnvComp = 0f;
             config.holdAltIK = 1.2f;
+            config.strictHoldNoDrift = true;
 
             if (explorer != null)
             {
@@ -339,12 +361,21 @@ namespace BalloonSim.UI
             ApplyStrongMixedDisturbance();
             config.controlMode = ControlMode.Stage3Policy;
             config.enableAIPredictor = false;
-            config.throttle = 4.0f;
-            config.manualSpeedScale = 1.2f;
+            config.throttle = 1.0f;
+            config.manualSpeedScale = 0.5f;
             config.densityRatio = 1.0f;
+            if (game != null)
+            {
+                game.stage3ResidualMaxSpeed = 0.25f;
+                game.stage3ResidualBlend = 1.0f;
+                game.stage3ResidualSlewRate = 2.0f;
+                game.stage3ResidualResponsiveness = 6.0f;
+                game.stage3MinForwardIntentFraction = 0.65f;
+            }
             if (policyRunner != null)
             {
                 policyRunner.enablePolicy = true;
+                policyRunner.maxPolicySpeed = game != null ? game.stage3ResidualMaxSpeed : 0.5f;
                 policyRunner.Reinitialize();
             }
         }

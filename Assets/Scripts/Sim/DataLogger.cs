@@ -35,6 +35,7 @@ namespace BalloonSim.Sim
 
         public string LogDirectory { get; private set; }
         public string CurrentLogPath { get; private set; }
+        public int WrittenSamples => _n;
 
         private StreamWriter _w;
         private int _n;
@@ -152,7 +153,9 @@ namespace BalloonSim.Sim
             if (enableStage3Columns)
             {
                 stateJson = BuildStage3StateJson(pos, vel, waypointPos, g, histCount);
-                Vector3 actionLabel = game != null ? game.LastDesiredVel : Vector3.zero;
+                Vector3 actionLabel = game != null
+                    ? game.ComputeExpertResidual(game.PlayerIntentVel, game.PlayerIntentActive)
+                    : Vector3.zero;
                 actionJson = BuildStage3ActionJson(actionLabel);
                 reward = ComputeStage3Reward(pos, vel, waypointPos, field != null ? field.Sample(pos) : Vector3.zero);
             }
@@ -195,12 +198,11 @@ namespace BalloonSim.Sim
             Vector3 wpDir = NormalizeOrZero(waypointPos - pos);
             var sb = new System.Text.StringBuilder(512);
             sb.Append('{');
+            sb.Append("\"action_semantics\":\"bounded_residual_v2\",");
             sb.Append("\"vel\":"); AppendJsonVec(sb, vel); sb.Append(',');
             sb.Append("\"wind\":"); AppendJsonVec(sb, wind); sb.Append(',');
-            sb.Append("\"alt_err\":").Append(F(waypointPos.y - pos.y)).Append(',');
-            sb.Append("\"waypoint_dir\":"); AppendJsonVec(sb, wpDir); sb.Append(',');
-            sb.Append("\"waypoint_dist\":").Append(F(Vector3.Distance(waypointPos, pos))).Append(',');
-            sb.Append("\"prev_action\":"); AppendJsonVec(sb, game != null ? game.LastDesiredVel : Vector3.zero); sb.Append(',');
+            sb.Append("\"intent\":"); AppendJsonVec(sb, game != null ? game.PlayerIntentVel : Vector3.zero); sb.Append(',');
+            sb.Append("\"intent_active\":").Append(game != null && game.PlayerIntentActive ? "1" : "0").Append(',');
             sb.Append("\"grad\":"); AppendJsonArray(sb, new[] { g[0,0], g[0,1], g[0,2], g[1,0], g[1,1], g[1,2], g[2,0], g[2,1], g[2,2] }); sb.Append(',');
             sb.Append("\"hist_count\":").Append(histCount);
             sb.Append('}');

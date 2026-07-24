@@ -10,7 +10,10 @@ namespace BalloonSim.Sim
     {
         [Header("Runtime")]
         public bool enablePolicy = true;
-        public float maxPolicySpeed = 2.0f;
+        [Tooltip("Must match GameController.expertMaxSpeed used to generate Stage3 labels.")]
+        public float maxPolicySpeed = 4.0f;
+        [Tooltip("Reject inference when normalization or metadata do not match the 22-to-3 policy schema.")]
+        public bool requireValidSchema = true;
         public bool verboseDiagnostics = true;
         public bool verboseInferenceDiagnostics = false;
 
@@ -22,6 +25,7 @@ namespace BalloonSim.Sim
         public string metaFileName = "policy_meta.json";
         public string stateInputName = "state_vector";
         public string actionOutputName = "action";
+        public string expectedActionSemantics = "bounded_residual_v2";
 
         [Header("Refs")]
         public SimulationConfig config;
@@ -33,6 +37,7 @@ namespace BalloonSim.Sim
 
         public bool IsPolicyAvailable { get; private set; }
         public string RuntimeMode { get; private set; } = "off";
+        public string ActionSemantics => _actionSemantics;
         public string LastStatusMessage { get; private set; } = "init";
         public string LastModelSource { get; private set; } = "n/a";
         public string LastNormSource { get; private set; } = "n/a";
@@ -42,8 +47,9 @@ namespace BalloonSim.Sim
 
         private float[] _stateMean = Array.Empty<float>();
         private float[] _stateStd = Array.Empty<float>();
-        private int _stateDim = 34;
-        private int _actionDim = 6;
+        private int _stateDim = 19;
+        private int _actionDim = 3;
+        private string _actionSemantics = string.Empty;
 
         private bool _sentisAvailable;
         private Type _modelAssetType;
@@ -88,6 +94,13 @@ namespace BalloonSim.Sim
             if (!IsPolicyAvailable || _worker == null)
                 return false;
 
+            if (requireValidSchema && !HasValidSchema(out var schemaError))
+            {
+                RuntimeMode = "fallback";
+                LastStatusMessage = schemaError;
+                return false;
+            }
+
             if (!BuildStateVector(out var state))
             {
                 LastStatusMessage = "Stage3 state build failed";
@@ -121,13 +134,18 @@ namespace BalloonSim.Sim
                 LastInferenceMs = (float)sw.Elapsed.TotalMilliseconds;
                 DisposeIfNeeded(tensor);
 
-                if (arr == null || arr.Length < 6)
+                if (arr == null || arr.Length < 3)
                 {
                     LastStatusMessage = "Stage3 action output read failed";
                     return false;
                 }
 
-                action = SixAxisToVector(arr);
+                action = new Vector3(arr[0], arr[1], arr[2]);
+                if (!IsFinite(action))
+                {
+                    LastStatusMessage = "Stage3 action contains NaN/Infinity";
+                    return false;
+                }
                 action = Vector3.ClampMagnitude(action, Mathf.Max(0.1f, maxPolicySpeed));
                 LastAction = action;
                 RuntimeMode = "onnx";
@@ -151,53 +169,58 @@ namespace BalloonSim.Sim
         private bool BuildStateVector(out float[] state)
         {
             state = new float[_stateDim];
-            if (balloon == null) return false;
+            if (balloon == null || _stateDim != 19) return false;
 
             Vector3 pos = balloon.transform.position;
             Vector3 vel = balloon.velocity;
-            Vector3 pred = autopilot != null ? autopilot.Predicted : Vector3.zero;
-            float sigma = autopilot != null ? autopilot.PredSigma : 1f;
-            Vector3 waypointPos = waypoint != null ? waypoint.position : pos;
-            Vector3 wpDelta = waypointPos - pos;
-            Vector3 wpDir = wpDelta.sqrMagnitude > 1e-8f ? wpDelta.normalized : Vector3.zero;
+            Vector3 wind = field != null ? field.Sample(pos) : Vector3.zero;
+            Vector3 intent = game != null ? game.PlayerIntentVel : Vector3.zero;
+            bool intentActive = game != null && game.PlayerIntentActive;
             float[,] g = field != null ? field.SampleGradient(pos) : new float[3, 3];
-            Vector3 prev = LastAction;
-
             int i = 0;
-            state[i++] = pos.x; state[i++] = pos.y; state[i++] = pos.z;
             state[i++] = vel.x; state[i++] = vel.y; state[i++] = vel.z;
-            state[i++] = pred.x; state[i++] = pred.y; state[i++] = pred.z;
-            state[i++] = sigma;
-            state[i++] = waypointPos.y - pos.y;
-            state[i++] = wpDir.x; state[i++] = wpDir.y; state[i++] = wpDir.z;
-            state[i++] = wpDelta.magnitude;
+            state[i++] = wind.x; state[i++] = wind.y; state[i++] = wind.z;
+            state[i++] = intent.x; state[i++] = intent.y; state[i++] = intent.z;
+            state[i++] = intentActive ? 1f : 0f;
             state[i++] = g[0, 0]; state[i++] = g[0, 1]; state[i++] = g[0, 2];
             state[i++] = g[1, 0]; state[i++] = g[1, 1]; state[i++] = g[1, 2];
             state[i++] = g[2, 0]; state[i++] = g[2, 1]; state[i++] = g[2, 2];
-            state[i++] = config != null ? config.beaufort : 0f;
-            state[i++] = config != null ? config.viscosity : 0f;
-            state[i++] = config != null ? config.gustStrength : 0f;
-            state[i++] = config != null ? config.densityRatio : 1f;
-            state[i++] = Mathf.Max(0f, prev.x); state[i++] = Mathf.Max(0f, -prev.x);
-            state[i++] = Mathf.Max(0f, prev.y); state[i++] = Mathf.Max(0f, -prev.y);
-            state[i++] = Mathf.Max(0f, prev.z); state[i++] = Mathf.Max(0f, -prev.z);
             return i == _stateDim;
-        }
-
-        private static Vector3 SixAxisToVector(float[] arr)
-        {
-            return new Vector3(
-                arr[0] - arr[1],
-                arr[2] - arr[3],
-                arr[4] - arr[5]
-            );
         }
 
         private void NormalizeStateInPlace(float[] state)
         {
             if (_stateMean.Length != state.Length || _stateStd.Length != state.Length) return;
             for (int i = 0; i < state.Length; i++)
-                state[i] = (state[i] - _stateMean[i]) / Mathf.Max(1e-6f, _stateStd[i]);
+                state[i] = Mathf.Clamp((state[i] - _stateMean[i]) / Mathf.Max(1e-6f, _stateStd[i]), -8f, 8f);
+        }
+
+        private bool HasValidSchema(out string error)
+        {
+            if (_stateDim != 19 || _actionDim != 3)
+            {
+                error = $"Stage3 schema mismatch: state={_stateDim}/19 action={_actionDim}/3";
+                return false;
+            }
+            if (_stateMean.Length != _stateDim || _stateStd.Length != _stateDim)
+            {
+                error = $"Stage3 normalization mismatch: mean={_stateMean.Length} std={_stateStd.Length} state={_stateDim}";
+                return false;
+            }
+            if (!string.Equals(_actionSemantics, expectedActionSemantics, StringComparison.Ordinal))
+            {
+                error = $"Stage3 action semantics mismatch: '{_actionSemantics}' != '{expectedActionSemantics}'";
+                return false;
+            }
+            error = null;
+            return true;
+        }
+
+        private static bool IsFinite(Vector3 value)
+        {
+            return !float.IsNaN(value.x) && !float.IsInfinity(value.x)
+                && !float.IsNaN(value.y) && !float.IsInfinity(value.y)
+                && !float.IsNaN(value.z) && !float.IsInfinity(value.z);
         }
 
         private void LoadNormAndMeta()
@@ -214,7 +237,7 @@ namespace BalloonSim.Sim
                     _stateMean = norm.state_mean ?? Array.Empty<float>();
                     _stateStd = norm.state_std ?? Array.Empty<float>();
                     _stateDim = norm.state_dim > 0 ? norm.state_dim : _stateMean.Length;
-                    _actionDim = norm.action_dim > 0 ? norm.action_dim : 6;
+                    _actionDim = norm.action_dim > 0 ? norm.action_dim : 3;
                     LastNormSource = normPath;
                 }
                 catch (Exception e)
@@ -233,8 +256,9 @@ namespace BalloonSim.Sim
                 try
                 {
                     var meta = JsonUtility.FromJson<PolicyMeta>(System.IO.File.ReadAllText(metaPath));
+                    _actionSemantics = meta.action_semantics ?? string.Empty;
                     if (!string.IsNullOrWhiteSpace(meta.onnx_file))
-                        LogDiag($"Stage3 meta loaded: onnx={meta.onnx_file}, state_dim={meta.state_dim}, action_dim={meta.action_dim}");
+                        LogDiag($"Stage3 meta loaded: onnx={meta.onnx_file}, state_dim={meta.state_dim}, action_dim={meta.action_dim}, semantics={_actionSemantics}");
                 }
                 catch (Exception e)
                 {
@@ -265,6 +289,7 @@ namespace BalloonSim.Sim
             public string norm_file;
             public int state_dim;
             public int action_dim;
+            public string action_semantics;
         }
 
         private void ProbeSentis()

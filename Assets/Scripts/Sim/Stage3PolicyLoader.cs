@@ -24,7 +24,7 @@ namespace BalloonSim.Sim
         public string streamingAssetsStage3Folder = "Stage3";
         public string policyMetaFile = "policy_meta.json";
         public string policyNormFile = "policy_norm.json";
-        public string modelResourcePath = "policy_net";
+        public string modelResourcePath = "Stage3/policy_net";
 
         [Header("I/O")]
         public string inputName = "state_vector";
@@ -176,13 +176,13 @@ namespace BalloonSim.Sim
                     arr = rb?.GetType().GetMethod("DownloadToArray", Type.EmptyTypes)?.Invoke(rb, null) as float[];
                 }
 
-                if (arr == null || arr.Length < 6)
+                if (arr == null || arr.Length < 3)
                 {
                     LastStatus = "action output read failed";
                     return false;
                 }
 
-                action = arr.Take(6).ToArray();
+                action = arr.Take(3).ToArray();
                 LastStatus = "inference ok";
                 return true;
             }
@@ -236,7 +236,7 @@ namespace BalloonSim.Sim
             LastNormSource = normPath;
 
             if (!string.IsNullOrWhiteSpace(meta?.onnx_file))
-                modelResourcePath = Path.GetFileNameWithoutExtension(meta.onnx_file);
+                modelResourcePath = "Stage3/" + Path.GetFileNameWithoutExtension(meta.onnx_file);
 
             return true;
         }

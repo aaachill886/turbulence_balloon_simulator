@@ -160,12 +160,9 @@ namespace BalloonSim.Sim
 
                 _holdIy = Mathf.Clamp(_holdIy + toSafe.y * dt, -6f, 6f);
 
-                // History-based hold target: only historical release state + current state.
                 Vector3 holdVel =
                     toSafe * config.holdPosK
-                    - balloon.velocity * config.holdVelK
-                    + _holdForwardAnchor * config.holdForwardK
-                    + _safeVel * config.holdReleaseVelK;
+                    - balloon.velocity * config.holdVelK;
 
                 holdVel.y += _holdIy * config.holdAltIK;
 
